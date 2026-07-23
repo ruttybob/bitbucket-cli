@@ -101,6 +101,7 @@ type Repository struct {
 	Slug      string `json:"slug"`
 	SCM       string `json:"scm"`
 	IsPrivate bool   `json:"is_private"`
+	UpdatedOn string `json:"updated_on"`
 	Links     struct {
 		Clone []struct {
 			Href string `json:"href"`
@@ -136,6 +137,16 @@ type PipelineState struct {
 	Name string `json:"name"`
 }
 
+// PipelineTrigger is the upstream trigger descriptor for a pipeline run.
+type PipelineTrigger struct {
+	Type     string `json:"type"`
+	RefName  string `json:"ref_name,omitempty"`
+	Selector *struct {
+		Type    string `json:"type"`
+		Pattern string `json:"pattern,omitempty"`
+	} `json:"selector,omitempty"`
+}
+
 // Pipeline represents a pipeline execution.
 type Pipeline struct {
 	UUID        string        `json:"uuid"`
@@ -147,8 +158,9 @@ type Pipeline struct {
 			Name string `json:"name"`
 		} `json:"ref"`
 	} `json:"target"`
-	CreatedOn   string `json:"created_on"`
-	CompletedOn string `json:"completed_on"`
+	Trigger     PipelineTrigger `json:"trigger"`
+	CreatedOn   string          `json:"created_on"`
+	CompletedOn string          `json:"completed_on"`
 }
 
 // NormalizeUUID wraps a canonical UUID in curly braces, as required by the

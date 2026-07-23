@@ -21,9 +21,15 @@ agent must know to work here without re-deriving it.
 ## The one-switch principle
 
 Every old command switched on `host.Kind`. Here that switch lives **once**, in
-the adapter (`internal/bitbucket/pr.go`): commands call `client.ListPRs(...)` and
-get normalized `[]bitbucket.PR`. Never sprinkle `cloud`/`dc` checks into command
-files — extend the adapter.
+the adapter: `pr.go`, `repo.go`, `branch.go`, `commit.go`, `pipeline.go`
+(`internal/bitbucket/`). Commands call e.g. `client.ListPRs(...)` and get
+normalized `[]bitbucket.PR`; `client.ListRepos`, `ListBranches`, `GetCommit`,
+`CommitDiff`, `CommitStatuses`, `ListPipelines`, … all return normalized
+domain models. Never sprinkle `cloud`/`dc` checks into command files — extend
+the adapter.
+
+- **Cloud-only nouns** (pipelines): the adapter guards with `bitbucket.CloudOnly(feature, c.hostKindLabel())`, which renders `pipelines is Bitbucket Cloud only; the active host is Bitbucket Data Center`. Use the same helper for any DC-only command added later (swap the wording to "Data Center only").
+- **Opt-in commit-derived fields**: branch `message`/`author`/`updated` and pipeline `steps` are not on the list payload, so the adapter fetches them per row only when requested via `--fields` (one extra request per row). Keep such extras opt-in.
 
 ## Output contract (do not regress)
 
@@ -35,6 +41,8 @@ files — extend the adapter.
 - Unknown flags must be rejected by name with an inline valid-flag list (exit 2).
   New commands declare their flag set on `app.Command.Flags`; globals are
   `--help`/`--json`/`--yaml`.
+- **Large content** (diffs, logs): default renders a **tail-truncated** preview (`axi.TruncateTail`, budgets in each command); `--full` writes the complete output to a temp file via `writeTempOutput` and emits `full_path:` + a `help[]` pointer. `axi.ExceedsBudget` gates the `--full` hint. Head truncation (`axi.TruncateBody`) is for bodies/descriptions.
+- `--text` (pipe-friendly) prints bare lines and short-circuits before schema rendering; declare it per command when useful.
 
 ## Commands
 
@@ -43,6 +51,7 @@ files — extend the adapter.
   for new commands.
 - Help blocks and the home view render automatically; do not hand-write TOON
   help strings outside `internal/axi` + `internal/app/help.go`.
+- **List-command checklist**: default minimal schema; `--fields` extras extend it via `extendSchema` (one `extraFields` map per command; unknown values exit 2 with the allowed list); a `count:` line via `countLine` (`N of M total` / `N shown (more available)` / bare `N`); and a `help[]` block from `internal/axi/suggest.go`. Detail commands truncate large fields with a `--full` escape hatch. `--json`/`--yaml` payloads are built from the same schema via `listPayloadRows`/`detailExtracted`.
 
 ## Build & test
 

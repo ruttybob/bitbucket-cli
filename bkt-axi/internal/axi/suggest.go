@@ -66,6 +66,77 @@ func AfterAuthStatus(configured int) []string {
 	return []string{"Run `bkt-axi pr list` to act on pull requests"}
 }
 
+// AfterRepoList returns hints to show after a non-empty repo list. When more
+// items exist beyond the returned page, the first hint tells the agent how to
+// see the rest.
+func AfterRepoList(moreAvailable bool) []string {
+	if moreAvailable {
+		return []string{"Raise --limit to see more repositories"}
+	}
+	return []string{"Run `bkt-axi repo view [<slug>]` for a repository's details"}
+}
+
+// EmptyRepoList returns the definitive empty-state hint for repo list.
+func EmptyRepoList(scope string) []string {
+	return []string{
+		"Confirm the resolved " + scope + " is correct",
+		"Run `bkt-axi repo list --workspace <other>` (Cloud) or `--project <KEY>` (DC) to target a different scope",
+	}
+}
+
+// AfterRepoView returns hints to show after a repo detail view.
+func AfterRepoView(slug string) []string {
+	return []string{"Run `bkt-axi branch list` to list branches in this repository"}
+}
+
+// AfterBranchList returns hints to show after a non-empty branch list.
+func AfterBranchList(moreAvailable bool) []string {
+	if moreAvailable {
+		return []string{"Raise --limit to see more branches"}
+	}
+	return []string{"Run `bkt-axi commit view <sha>` for a commit's details"}
+}
+
+// EmptyBranchList returns the definitive empty-state hint for branch list.
+func EmptyBranchList() []string {
+	return []string{
+		"Run `bkt-axi repo list` to confirm the resolved repository",
+		"Run `bkt-axi branch list --filter <text>` to match branches by name",
+	}
+}
+
+// AfterCommitView returns hints to show after a commit detail view.
+func AfterCommitView(sha string) []string {
+	return []string{
+		"Run `bkt-axi commit diff " + sha + "^.." + sha + "` for the commit's changes",
+		"Run `bkt-axi commit status " + sha + "` for build statuses",
+	}
+}
+
+// EmptyCommitStatus returns the definitive empty-state hint for commit status.
+func EmptyCommitStatus() []string {
+	return []string{
+		"Run `bkt-axi pipeline list` for Cloud CI runs",
+		"Commit statuses appear once a CI system reports on this commit",
+	}
+}
+
+// AfterPipelineList returns hints to show after a non-empty pipeline list.
+func AfterPipelineList(moreAvailable bool) []string {
+	if moreAvailable {
+		return []string{"Raise --limit to see more pipelines"}
+	}
+	return []string{"Run `bkt-axi pipeline view <id>` for a pipeline's details"}
+}
+
+// EmptyPipelineList returns the definitive empty-state hint for pipeline list.
+func EmptyPipelineList() []string {
+	return []string{
+		"Run `bkt-axi pipeline list --limit 50` to widen the window",
+		"Run `bkt-axi repo view` to confirm the resolved repository",
+	}
+}
+
 func itoa(n int) string {
 	const digits = "0123456789"
 	if n == 0 {
