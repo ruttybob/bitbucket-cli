@@ -58,6 +58,15 @@ type Comment struct {
 	Text      string    `toon:"text"`
 }
 
+// PRMutation is the result of a normalized PR mutation: the updated pull
+// request plus a flag reporting whether the target state already held (an
+// idempotent no-op, AXI §6). Commands render the "(already — no-op)" suffix on
+// the state field when Already is true.
+type PRMutation struct {
+	PR      *PR
+	Already bool
+}
+
 // Repo is the normalized repository. The home view and `repo` commands render
 // it; the `repo list` schema projects a subset via the axi field DSL.
 type Repo struct {
@@ -101,6 +110,14 @@ type BranchListResult struct {
 	Branches      []Branch
 	Shown         int
 	MoreAvailable bool
+}
+
+// BranchMutation is the result of a normalized branch mutation. DC branch
+// creation echoes the new branch; the Already flag covers a future "already
+// exists" no-op. Name is the human-friendly branch name (e.g. "feature/x").
+type BranchMutation struct {
+	Name    string
+	Already bool
 }
 
 // Commit is the normalized commit used by `commit view`.

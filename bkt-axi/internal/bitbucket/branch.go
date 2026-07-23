@@ -132,3 +132,67 @@ func firstLine(s string) string {
 	}
 	return strings.TrimSpace(s)
 }
+
+// --- mutations (Phase 2, Data Center) ------------------------------------
+
+// CreateBranchInput configures branch creation (Data Center).
+type CreateBranchInput struct {
+	Name    string
+	From    string // start point (branch or commit); defaults to the repo's default branch when empty
+	Message string
+}
+
+// CreateBranch creates a branch in the resolved repository and returns the
+// normalized result. Branch creation is a Data Center operation in this phase;
+// on Cloud the adapter returns a clear not-supported error so the command layer
+// never switches on host kind.
+func (c *Client) CreateBranch(ctx context.Context, scope Scope, in CreateBranchInput) (*BranchMutation, error) {
+	if c.Kind != KindDC {
+		return nil, fmt.Errorf("branch create is supported only on Bitbucket Data Center (active host kind: %s)", c.Kind)
+	}
+	if scope.ProjectKey == "" || scope.RepoSlug == "" {
+		return nil, fmt.Errorf("project and repo are required; use --project/--repo or set a context")
+	}
+	if in.Name == "" {
+		return nil, fmt.Errorf("branch name is required as the positional argument")
+	}
+	startPoint := in.From
+	if startPoint == "" {
+		def, err := c.dc.GetRepository(ctx, scope.ProjectKey, scope.RepoSlug)
+		if err != nil {
+			return nil, mapHTTPError(err, "repository")
+		}
+		startPoint = def.DefaultBranch
+	}
+	if startPoint == "" {
+		return nil, fmt.Errorf("could not determine a start point; pass --from <branch-or-commit>")
+	}
+	branch, err := c.dc.CreateBranch(ctx, scope.ProjectKey, scope.RepoSlug, dc.CreateBranchInput{
+		Name:       in.Name,
+		StartPoint: startPoint,
+		Message:    in.Message,
+	})
+	if err != nil {
+		return nil, mapHTTPError(err, "branch")
+	}
+	return &BranchMutation{Name: branch.DisplayID}, nil
+}
+
+// DeleteBranch removes a branch from the resolved repository. dryRun reports
+// whether the branch would be deletable without actually deleting it. Data
+// Center only.
+func (c *Client) DeleteBranch(ctx context.Context, scope Scope, name string, dryRun bool) error {
+	if c.Kind != KindDC {
+		return fmt.Errorf("branch delete is supported only on Bitbucket Data Center (active host kind: %s)", c.Kind)
+	}
+	if scope.ProjectKey == "" || scope.RepoSlug == "" {
+		return fmt.Errorf("project and repo are required; use --project/--repo or set a context")
+	}
+	if name == "" {
+		return fmt.Errorf("branch name is required as the positional argument")
+	}
+	if err := c.dc.DeleteBranch(ctx, scope.ProjectKey, scope.RepoSlug, name, dryRun); err != nil {
+		return mapHTTPError(err, "branch")
+	}
+	return nil
+}

@@ -34,10 +34,10 @@ func NewPRCmd() *app.Command {
 		Name:  "pr",
 		Short: "Work with pull requests",
 		Long:  "List and inspect pull requests across Bitbucket Cloud and Data Center.",
-		Children: []*app.Command{
+		Children: append([]*app.Command{
 			newPRListCmd(),
 			newPRViewCmd(),
-		},
+		}, newPRMutationChildren()...),
 	}
 }
 

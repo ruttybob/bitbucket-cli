@@ -515,8 +515,21 @@ type CommentOptions struct {
 // When ParentID > 0, the comment is a threaded reply.
 // When File is set with FromLine or ToLine, the comment targets a specific diff line.
 func (c *Client) CommentPullRequest(ctx context.Context, projectKey, repoSlug string, prID int, opts CommentOptions) error {
+	_, err := c.CreatePullRequestComment(ctx, projectKey, repoSlug, prID, opts)
+	return err
+}
+
+// CreatePullRequestComment adds a comment to the pull request and returns the
+// created comment (with its server-assigned id). The POST response echoes the
+// created representation; a 2xx with an empty body yields a zero-id comment
+// (still a success). When ParentID > 0 the reply is verified to thread under
+// the requested parent.
+func (c *Client) CreatePullRequestComment(ctx context.Context, projectKey, repoSlug string, prID int, opts CommentOptions) (*PullRequestComment, error) {
+	if projectKey == "" || repoSlug == "" {
+		return nil, fmt.Errorf("project key and repository slug are required")
+	}
 	if strings.TrimSpace(opts.Text) == "" {
-		return fmt.Errorf("comment text is required")
+		return nil, fmt.Errorf("comment text is required")
 	}
 
 	body := map[string]any{"text": opts.Text}
@@ -547,9 +560,14 @@ func (c *Client) CommentPullRequest(ctx context.Context, projectKey, repoSlug st
 		prID,
 	), body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return c.http.Do(req, nil)
+
+	var created PullRequestComment
+	if err := c.http.Do(req, &created); err != nil {
+		return nil, err
+	}
+	return &created, nil
 }
 
 // UpdatePROptions configures pull request updates.
