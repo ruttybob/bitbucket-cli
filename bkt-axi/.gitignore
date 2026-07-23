@@ -1,0 +1,3 @@
+# Built binary (go build ./cmd/bkt-axi without -o writes ./bkt-axi)
+/bkt-axi
+*.test

@@ -1,0 +1,1973 @@
+package cloud_test
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ruttybob/bkt-axi/internal/bitbucket/cloud"
+	"github.com/ruttybob/bkt-axi/internal/bitbucket/httpx"
+)
+
+func newTestClient(t *testing.T, handler http.Handler) *cloud.Client {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client, err := cloud.New(cloud.Options{
+		BaseURL:           server.URL,
+		Username:          "user",
+		Token:             "token",
+		MergePollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	return client
+}
+
+func TestGetPullRequest(t *testing.T) {
+	var gotMethod, gotPath string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":    7,
+			"title": "Test PR",
+			"state": "OPEN",
+		})
+	}))
+
+	pr, err := client.GetPullRequest(context.Background(), "myworkspace", "my-repo", 7)
+	if err != nil {
+		t.Fatalf("GetPullRequest: %v", err)
+	}
+	if gotMethod != "GET" {
+		t.Errorf("method = %s, want GET", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/pullrequests/7" {
+		t.Errorf("path = %q, want /repositories/myworkspace/my-repo/pullrequests/7", gotPath)
+	}
+	if pr.ID != 7 {
+		t.Errorf("pr.ID = %d, want 7", pr.ID)
+	}
+}
+
+func TestGetPullRequestValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+	}{
+		{"empty workspace", "", "repo"},
+		{"empty repo", "ws", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.GetPullRequest(context.Background(), tt.workspace, tt.repo, 1)
+			if err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestListPullRequestsPaginates(t *testing.T) {
+	var hits int32
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		switch count {
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{{"id": 1}, {"id": 2}},
+				"next":   serverURL + "/repositories/ws/repo/pullrequests?pagelen=20&page=2",
+			})
+		case 2:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{{"id": 3}},
+			})
+		default:
+			t.Fatalf("unexpected request %d", count)
+		}
+	}))
+	serverURL = server.URL
+	t.Cleanup(server.Close)
+
+	client, err := cloud.New(cloud.Options{BaseURL: server.URL, Username: "u", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prs, err := client.ListPullRequests(context.Background(), "ws", "repo", cloud.PullRequestListOptions{
+		State: "OPEN",
+		Limit: 0,
+	})
+	if err != nil {
+		t.Fatalf("ListPullRequests: %v", err)
+	}
+	if len(prs) != 3 {
+		t.Fatalf("expected 3 PRs, got %d", len(prs))
+	}
+	if hits != 2 {
+		t.Fatalf("expected 2 requests, got %d", hits)
+	}
+}
+
+func TestListPullRequestsRespectsLimit(t *testing.T) {
+	var hits int32
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"values": []map[string]any{{"id": 1}, {"id": 2}, {"id": 3}},
+			"next":   serverURL + "/repositories/ws/repo/pullrequests?page=2",
+		})
+	}))
+	serverURL = server.URL
+	t.Cleanup(server.Close)
+
+	client, err := cloud.New(cloud.Options{BaseURL: server.URL, Username: "u", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prs, err := client.ListPullRequests(context.Background(), "ws", "repo", cloud.PullRequestListOptions{
+		Limit: 2,
+	})
+	if err != nil {
+		t.Fatalf("ListPullRequests: %v", err)
+	}
+	if len(prs) != 2 {
+		t.Errorf("expected 2 PRs, got %d", len(prs))
+	}
+}
+
+func TestListPullRequestsMineFiltersByAuthorUUID(t *testing.T) {
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query().Get("q")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": []map[string]any{}})
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := cloud.New(cloud.Options{BaseURL: server.URL, Username: "email@example.com", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.ListPullRequests(context.Background(), "ws", "repo", cloud.PullRequestListOptions{
+		Mine: "{550e8400-e29b-41d4-a716-446655440000}",
+	})
+	if err != nil {
+		t.Fatalf("ListPullRequests: %v", err)
+	}
+
+	if gotQuery != `author.uuid = "{550e8400-e29b-41d4-a716-446655440000}"` {
+		t.Fatalf("q = %q, want author.uuid filter", gotQuery)
+	}
+}
+
+func TestListRepositoriesPaginates(t *testing.T) {
+	var hits int32
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		switch count {
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{{"slug": "repo1"}},
+				"next":   serverURL + "/repositories/ws?pagelen=20&page=2",
+			})
+		case 2:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{{"slug": "repo2"}},
+			})
+		default:
+			t.Fatalf("unexpected request %d", count)
+		}
+	}))
+	serverURL = server.URL
+	t.Cleanup(server.Close)
+
+	client, err := cloud.New(cloud.Options{BaseURL: server.URL, Username: "u", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repos, err := client.ListRepositories(context.Background(), "ws", 0)
+	if err != nil {
+		t.Fatalf("ListRepositories: %v", err)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("expected 2 repos, got %d", len(repos))
+	}
+	if hits != 2 {
+		t.Fatalf("expected 2 requests, got %d", hits)
+	}
+}
+
+func TestListRepositoriesRespectsLimit(t *testing.T) {
+	var hits int32
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"values": []map[string]any{{"slug": "r1"}, {"slug": "r2"}, {"slug": "r3"}},
+			"next":   serverURL + "/repositories/ws?page=2",
+		})
+	}))
+	serverURL = server.URL
+	t.Cleanup(server.Close)
+
+	client, err := cloud.New(cloud.Options{BaseURL: server.URL, Username: "u", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repos, err := client.ListRepositories(context.Background(), "ws", 2)
+	if err != nil {
+		t.Fatalf("ListRepositories: %v", err)
+	}
+	if len(repos) != 2 {
+		t.Errorf("expected 2 repos, got %d", len(repos))
+	}
+}
+
+func TestDeclinePullRequest(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody []byte
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	if err := client.DeclinePullRequest(context.Background(), "myworkspace", "my-repo", 7, ""); err != nil {
+		t.Fatalf("DeclinePullRequest: %v", err)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/pullrequests/7/decline" {
+		t.Errorf("path = %s, want .../7/decline", gotPath)
+	}
+	if len(gotBody) > 0 {
+		t.Errorf("expected no body when message is empty, got: %s", gotBody)
+	}
+}
+
+func TestDeclinePullRequestWithMessage(t *testing.T) {
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	if err := client.DeclinePullRequest(context.Background(), "myworkspace", "my-repo", 7, "needs more work"); err != nil {
+		t.Fatalf("DeclinePullRequest: %v", err)
+	}
+	if gotBody["message"] != "needs more work" {
+		t.Errorf("message = %v, want %q", gotBody["message"], "needs more work")
+	}
+}
+
+func TestDeclinePullRequestValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+	}{
+		{"empty workspace", "", "repo"},
+		{"empty repo", "ws", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := client.DeclinePullRequest(context.Background(), tt.workspace, tt.repo, 1, ""); err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestReopenPullRequest(t *testing.T) {
+	var gotMethod, gotPath string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	if err := client.ReopenPullRequest(context.Background(), "myworkspace", "my-repo", 7); err != nil {
+		t.Fatalf("ReopenPullRequest: %v", err)
+	}
+	if gotMethod != "PUT" {
+		t.Errorf("method = %s, want PUT", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/pullrequests/7" {
+		t.Errorf("path = %s, want .../pullrequests/7", gotPath)
+	}
+}
+
+func TestReopenPullRequestValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+	}{
+		{"empty workspace", "", "repo"},
+		{"empty repo", "ws", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := client.ReopenPullRequest(context.Background(), tt.workspace, tt.repo, 1); err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestCommentPullRequest(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{Text: "LGTM"})
+	if err != nil {
+		t.Fatalf("CommentPullRequest: %v", err)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/pullrequests/7/comments" {
+		t.Errorf("path = %s, want .../comments", gotPath)
+	}
+
+	content, ok := gotBody["content"].(map[string]any)
+	if !ok {
+		t.Fatalf("request body missing content object")
+	}
+	if raw, ok := content["raw"].(string); !ok || raw != "LGTM" {
+		t.Errorf("content.raw = %q, want LGTM", raw)
+	}
+}
+
+func TestCommentPullRequestValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+		text      string
+	}{
+		{"empty workspace", "", "repo", "text"},
+		{"empty repo", "ws", "", "text"},
+		{"empty text", "ws", "repo", ""},
+		{"blank text", "ws", "repo", "   "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := client.CommentPullRequest(context.Background(), tt.workspace, tt.repo, 1, cloud.CommentOptions{Text: tt.text}); err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestCommentPullRequestWithParent(t *testing.T) {
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{Text: "reply", ParentID: 42})
+	if err != nil {
+		t.Fatalf("CommentPullRequest with parent: %v", err)
+	}
+
+	parent, ok := gotBody["parent"].(map[string]any)
+	if !ok {
+		t.Fatal("request body missing parent object")
+	}
+	if id, ok := parent["id"].(float64); !ok || int(id) != 42 {
+		t.Errorf("parent.id = %v, want 42", parent["id"])
+	}
+}
+
+func TestCommentPullRequestWithoutParent(t *testing.T) {
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{Text: "top-level"})
+	if err != nil {
+		t.Fatalf("CommentPullRequest without parent: %v", err)
+	}
+
+	if _, ok := gotBody["parent"]; ok {
+		t.Error("expected no parent field in body when parentID is 0")
+	}
+}
+
+func TestCommentPullRequestParentThreadingVerification(t *testing.T) {
+	tests := []struct {
+		name         string
+		parentID     int
+		responseBody string
+		wantErr      bool
+		wantErrParts []string
+	}{
+		{
+			name:         "threaded reply echoed by Bitbucket",
+			parentID:     42,
+			responseBody: `{"id":100,"parent":{"id":42},"content":{"raw":"reply"}}`,
+			wantErr:      false,
+		},
+		{
+			name:         "parent silently dropped to top-level",
+			parentID:     42,
+			responseBody: `{"id":100,"content":{"raw":"reply"}}`,
+			wantErr:      true,
+			wantErrParts: []string{"100", "42", "parent"},
+		},
+		{
+			name:         "parent threaded under a different comment",
+			parentID:     42,
+			responseBody: `{"id":100,"parent":{"id":7},"content":{"raw":"reply"}}`,
+			wantErr:      true,
+			wantErrParts: []string{"100", "42", "parent"},
+		},
+		{
+			name:         "empty 2xx body is treated as success",
+			parentID:     42,
+			responseBody: "",
+			wantErr:      false,
+		},
+		{
+			name:         "no parent requested skips verification even if body lacks parent",
+			parentID:     0,
+			responseBody: `{"id":100,"content":{"raw":"top-level"}}`,
+			wantErr:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotBody map[string]any
+			client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&gotBody)
+				w.WriteHeader(http.StatusCreated)
+				if tt.responseBody != "" {
+					_, _ = w.Write([]byte(tt.responseBody))
+				}
+			}))
+
+			err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{
+				Text:     "reply",
+				ParentID: tt.parentID,
+			})
+
+			if tt.parentID > 0 {
+				parent, ok := gotBody["parent"].(map[string]any)
+				if !ok {
+					t.Fatalf("request body missing parent object")
+				}
+				if id, ok := parent["id"].(float64); !ok || int(id) != tt.parentID {
+					t.Errorf("parent.id = %v, want %d", parent["id"], tt.parentID)
+				}
+			}
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				for _, part := range tt.wantErrParts {
+					if !strings.Contains(err.Error(), part) {
+						t.Errorf("error %q missing %q", err.Error(), part)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CommentPullRequest: %v", err)
+			}
+		})
+	}
+}
+
+func TestCommentPullRequestInlineToLine(t *testing.T) {
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{
+		Text:   "needs fix",
+		File:   "src/handler.go",
+		ToLine: 25,
+	})
+	if err != nil {
+		t.Fatalf("CommentPullRequest inline to-line: %v", err)
+	}
+
+	inline, ok := gotBody["inline"].(map[string]any)
+	if !ok {
+		t.Fatal("request body missing inline object")
+	}
+	if inline["path"] != "src/handler.go" {
+		t.Errorf("inline.path = %v, want src/handler.go", inline["path"])
+	}
+	if to, ok := inline["to"].(float64); !ok || int(to) != 25 {
+		t.Errorf("inline.to = %v, want 25", inline["to"])
+	}
+	if _, ok := inline["from"]; ok {
+		t.Error("expected no from field when only to-line is set")
+	}
+}
+
+func TestCommentPullRequestInlineFromLine(t *testing.T) {
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{
+		Text:     "was this intentional?",
+		File:     "src/handler.go",
+		FromLine: 10,
+	})
+	if err != nil {
+		t.Fatalf("CommentPullRequest inline from-line: %v", err)
+	}
+
+	inline, ok := gotBody["inline"].(map[string]any)
+	if !ok {
+		t.Fatal("request body missing inline object")
+	}
+	if inline["path"] != "src/handler.go" {
+		t.Errorf("inline.path = %v, want src/handler.go", inline["path"])
+	}
+	if from, ok := inline["from"].(float64); !ok || int(from) != 10 {
+		t.Errorf("inline.from = %v, want 10", inline["from"])
+	}
+	if _, ok := inline["to"]; ok {
+		t.Error("expected no to field when only from-line is set")
+	}
+}
+
+func TestCommentPullRequestNoInlineWhenFileEmpty(t *testing.T) {
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{
+		Text: "general comment",
+	})
+	if err != nil {
+		t.Fatalf("CommentPullRequest: %v", err)
+	}
+
+	if _, ok := gotBody["inline"]; ok {
+		t.Error("expected no inline field for general comment")
+	}
+}
+
+func TestCommentPullRequestPending(t *testing.T) {
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{
+		Text:    "draft feedback",
+		Pending: true,
+	})
+	if err != nil {
+		t.Fatalf("CommentPullRequest pending: %v", err)
+	}
+
+	pending, ok := gotBody["pending"].(bool)
+	if !ok || !pending {
+		t.Errorf("pending = %v, want true", gotBody["pending"])
+	}
+}
+
+func TestCommentPullRequestNotPending(t *testing.T) {
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	err := client.CommentPullRequest(context.Background(), "myworkspace", "my-repo", 7, cloud.CommentOptions{
+		Text: "regular comment",
+	})
+	if err != nil {
+		t.Fatalf("CommentPullRequest: %v", err)
+	}
+
+	if _, ok := gotBody["pending"]; ok {
+		t.Error("expected no pending field when Pending is false")
+	}
+}
+
+func TestPullRequestDiff(t *testing.T) {
+	const wantDiff = "diff --git a/foo.go b/foo.go\n--- a/foo.go\n+++ b/foo.go\n"
+	var gotMethod, gotPath, gotAccept string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAccept = r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(wantDiff))
+	}))
+
+	var buf strings.Builder
+	err := client.PullRequestDiff(context.Background(), "myworkspace", "my-repo", 7, &buf)
+	if err != nil {
+		t.Fatalf("PullRequestDiff: %v", err)
+	}
+	if gotMethod != "GET" {
+		t.Errorf("method = %s, want GET", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/pullrequests/7/diff" {
+		t.Errorf("path = %q, want /repositories/myworkspace/my-repo/pullrequests/7/diff", gotPath)
+	}
+	if gotAccept != "text/plain" {
+		t.Errorf("Accept = %q, want text/plain", gotAccept)
+	}
+	if buf.String() != wantDiff {
+		t.Errorf("diff body = %q, want %q", buf.String(), wantDiff)
+	}
+}
+
+func TestPullRequestDiffValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+		writer    io.Writer
+	}{
+		{"empty workspace", "", "repo", &buf},
+		{"empty repo", "ws", "", &buf},
+		{"nil writer", "ws", "repo", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := client.PullRequestDiff(context.Background(), tt.workspace, tt.repo, 1, tt.writer); err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestMergePullRequest(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	err := client.MergePullRequest(context.Background(), "myworkspace", "my-repo", 7, "squash commit", "squash", true)
+	if err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/pullrequests/7/merge" {
+		t.Errorf("path = %s, want .../7/merge", gotPath)
+	}
+	if gotBody["message"] != "squash commit" {
+		t.Errorf("body.message = %v, want %q", gotBody["message"], "squash commit")
+	}
+	if gotBody["merge_strategy"] != "squash" {
+		t.Errorf("body.merge_strategy = %v, want %q", gotBody["merge_strategy"], "squash")
+	}
+	if gotBody["close_source_branch"] != true {
+		t.Errorf("body.close_source_branch = %v, want true", gotBody["close_source_branch"])
+	}
+}
+
+func TestMergePullRequestValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+	}{
+		{"empty workspace", "", "repo"},
+		{"empty repo", "ws", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := client.MergePullRequest(context.Background(), tt.workspace, tt.repo, 1, "", "", false); err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestMergePullRequestAcceptsCloudStrategies(t *testing.T) {
+	strategies := []string{
+		"merge_commit",
+		"squash",
+		"fast_forward",
+		"squash_fast_forward",
+		"rebase_fast_forward",
+		"rebase_merge",
+	}
+
+	for _, strategy := range strategies {
+		t.Run(strategy, func(t *testing.T) {
+			var gotBody map[string]any
+			client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					t.Errorf("method = %s, want POST", r.Method)
+				}
+				if r.URL.Path != "/repositories/ws/repo/pullrequests/1/merge" {
+					t.Errorf("path = %s, want /repositories/ws/repo/pullrequests/1/merge", r.URL.Path)
+				}
+				_ = json.NewDecoder(r.Body).Decode(&gotBody)
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			if err := client.MergePullRequest(context.Background(), "ws", "repo", 1, "", strategy, false); err != nil {
+				t.Fatalf("MergePullRequest strategy %q: %v", strategy, err)
+			}
+			if gotBody["merge_strategy"] != strategy {
+				t.Fatalf("merge_strategy = %v, want %q", gotBody["merge_strategy"], strategy)
+			}
+		})
+	}
+}
+
+func TestMergePullRequestInvalidStrategy(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Invalid strategy should return error
+	invalidStrategies := []string{"squah", "rebase", "merge-commit", "fast-forward", "SQUASH"}
+	for _, s := range invalidStrategies {
+		t.Run("invalid_"+s, func(t *testing.T) {
+			err := client.MergePullRequest(context.Background(), "ws", "repo", 1, "", s, false)
+			if err == nil {
+				t.Errorf("expected error for strategy %q", s)
+			} else if !strings.Contains(err.Error(), "squash_fast_forward, rebase_fast_forward, rebase_merge") {
+				t.Errorf("error = %q, want all valid Cloud strategies listed", err)
+			}
+		})
+	}
+
+	// Valid strategies should not fail validation (they'll fail on network, but not validation).
+	// Empty string is valid (means "use default"). A network error is expected here.
+	_ = client.MergePullRequest(context.Background(), "ws", "repo", 1, "", "", false)
+}
+
+func TestMergePullRequest202AsyncPolling(t *testing.T) {
+	var pollCount int32
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/merge") {
+			// Return 202 with task_id
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"task_id": "abc-123",
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/task-status/") {
+			count := atomic.AddInt32(&pollCount, 1)
+			w.Header().Set("Content-Type", "application/json")
+			if count < 3 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"task_status": "PENDING",
+				})
+			} else {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"task_status": "SUCCESS",
+				})
+			}
+			return
+		}
+		t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+
+	err := client.MergePullRequest(context.Background(), "ws", "repo", 1, "", "squash", false)
+	if err != nil {
+		t.Fatalf("MergePullRequest with 202: %v", err)
+	}
+	if pollCount != 3 {
+		t.Errorf("expected 3 poll attempts, got %d", pollCount)
+	}
+}
+
+func TestMergePullRequest202AsyncDeadlineErrorIsActionable(t *testing.T) {
+	statusStarted := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/merge") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"task_id": "slow-123",
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/task-status/") {
+			close(statusStarted)
+			<-r.Context().Done()
+			return
+		}
+		t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := cloud.New(cloud.Options{
+		BaseURL:           server.URL,
+		Username:          "user",
+		Token:             "token",
+		Retry:             httpx.RetryPolicy{MaxAttempts: 1},
+		MergePollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.MergePullRequest(ctx, "ws", "repo", 1, "", "squash", false)
+	}()
+
+	select {
+	case <-statusStarted:
+	case <-time.After(time.Second):
+		t.Fatal("merge task status request did not start")
+	}
+
+	select {
+	case err = <-errCh:
+	case <-time.After(time.Second):
+		t.Fatal("MergePullRequest did not return after context deadline")
+	}
+	if err == nil {
+		t.Fatal("expected merge timeout error")
+	}
+	for _, want := range []string{"merge task slow-123", "pull request #1", "may still be running", context.DeadlineExceeded.Error()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want substring %q", err, want)
+		}
+	}
+}
+
+func TestMergePullRequest202AsyncFailure(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/merge") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"task_id": "abc-456",
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/task-status/") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"task_status": "FAILED",
+			})
+			return
+		}
+	}))
+
+	err := client.MergePullRequest(context.Background(), "ws", "repo", 1, "", "", false)
+	if err == nil {
+		t.Fatal("expected error for failed merge task")
+	}
+	if !strings.Contains(err.Error(), "merge task abc-456") || !strings.Contains(err.Error(), "failed with status: FAILED") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestCreatePullRequestDraftFlag(t *testing.T) {
+	tests := []struct {
+		name      string
+		draft     bool
+		wantDraft bool
+	}{
+		{name: "draft true", draft: true, wantDraft: true},
+		{name: "draft false", draft: false, wantDraft: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotBody map[string]any
+			client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&gotBody)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			}))
+
+			_, _ = client.CreatePullRequest(context.Background(), "ws", "repo", cloud.CreatePullRequestInput{
+				Title:       "Test PR",
+				Source:      "feature",
+				Destination: "main",
+				Draft:       tt.draft,
+			})
+
+			got, ok := gotBody["draft"].(bool)
+			if !ok {
+				t.Fatal("draft field missing from request body")
+			}
+			if got != tt.wantDraft {
+				t.Errorf("draft = %v, want %v", got, tt.wantDraft)
+			}
+		})
+	}
+}
+
+func TestCreatePullRequestReviewerAutoDetect(t *testing.T) {
+	tests := []struct {
+		name       string
+		reviewers  []string
+		wantFields []string // expected key for each reviewer in request body
+	}{
+		{
+			name:       "uuid with braces",
+			reviewers:  []string{"{550e8400-e29b-41d4-a716-446655440000}"},
+			wantFields: []string{"uuid"},
+		},
+		{
+			name:       "uuid without braces",
+			reviewers:  []string{"550e8400-e29b-41d4-a716-446655440000"},
+			wantFields: []string{"uuid"},
+		},
+		{
+			name:       "username",
+			reviewers:  []string{"alice"},
+			wantFields: []string{"username"},
+		},
+		{
+			name:       "account_id",
+			reviewers:  []string{"557058:12345678-1234-1234-1234-123456789abc"},
+			wantFields: []string{"account_id"},
+		},
+		{
+			name:       "mixed",
+			reviewers:  []string{"{550e8400-e29b-41d4-a716-446655440000}", "bob"},
+			wantFields: []string{"uuid", "username"},
+		},
+		{
+			name:       "mixed all three",
+			reviewers:  []string{"{550e8400-e29b-41d4-a716-446655440000}", "bob", "557058:12345678-1234-1234-1234-123456789abc"},
+			wantFields: []string{"uuid", "username", "account_id"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotBody map[string]any
+			client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&gotBody)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			}))
+
+			_, _ = client.CreatePullRequest(context.Background(), "ws", "repo", cloud.CreatePullRequestInput{
+				Title:       "Test PR",
+				Source:      "feature",
+				Destination: "main",
+				Reviewers:   tt.reviewers,
+			})
+
+			reviewers, ok := gotBody["reviewers"].([]any)
+			if !ok {
+				t.Fatal("reviewers missing from request body")
+			}
+			if len(reviewers) != len(tt.wantFields) {
+				t.Fatalf("expected %d reviewers, got %d", len(tt.wantFields), len(reviewers))
+			}
+			for i, field := range tt.wantFields {
+				rev := reviewers[i].(map[string]any)
+				if _, ok := rev[field]; !ok {
+					t.Errorf("reviewer[%d]: expected %q field, got keys %v", i, field, rev)
+				}
+			}
+		})
+	}
+}
+
+func TestApprovePullRequest(t *testing.T) {
+	var gotMethod, gotPath string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	if err := client.ApprovePullRequest(context.Background(), "myworkspace", "my-repo", 7); err != nil {
+		t.Fatalf("ApprovePullRequest: %v", err)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/pullrequests/7/approve" {
+		t.Errorf("path = %s, want .../7/approve", gotPath)
+	}
+}
+
+func TestApprovePullRequestValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+	}{
+		{"empty workspace", "", "repo"},
+		{"empty repo", "ws", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := client.ApprovePullRequest(context.Background(), tt.workspace, tt.repo, 1); err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestGetEffectiveDefaultReviewers(t *testing.T) {
+	var gotMethod, gotPath string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"values": []map[string]any{
+				{"user": map[string]any{"username": "alice", "display_name": "Alice A", "uuid": "{aaa}"}},
+				{"user": map[string]any{"username": "bob", "display_name": "Bob B", "uuid": "{bbb}"}},
+			},
+		})
+	}))
+
+	users, err := client.GetEffectiveDefaultReviewers(context.Background(), "myworkspace", "my-repo")
+	if err != nil {
+		t.Fatalf("GetEffectiveDefaultReviewers: %v", err)
+	}
+	if gotMethod != "GET" {
+		t.Errorf("method = %s, want GET", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/effective-default-reviewers" {
+		t.Errorf("path = %q, want /repositories/myworkspace/my-repo/effective-default-reviewers", gotPath)
+	}
+	if len(users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(users))
+	}
+	if users[0].Username != "alice" {
+		t.Errorf("users[0].Username = %q, want alice", users[0].Username)
+	}
+	if users[0].Display != "Alice A" {
+		t.Errorf("users[0].Display = %q, want Alice A", users[0].Display)
+	}
+	if users[1].Username != "bob" {
+		t.Errorf("users[1].Username = %q, want bob", users[1].Username)
+	}
+}
+
+func TestGetEffectiveDefaultReviewersPagination(t *testing.T) {
+	calls := 0
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{
+					{"user": map[string]any{"username": "alice"}},
+				},
+				"next": "http://" + r.Host + "/repositories/ws/repo/effective-default-reviewers?pagelen=100&page=2",
+			})
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{
+					{"user": map[string]any{"username": "bob"}},
+				},
+			})
+		}
+	}))
+
+	users, err := client.GetEffectiveDefaultReviewers(context.Background(), "ws", "repo")
+	if err != nil {
+		t.Fatalf("GetEffectiveDefaultReviewers: %v", err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("expected 2 users across pages, got %d", len(users))
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 API calls for pagination, got %d", calls)
+	}
+}
+
+func TestGetEffectiveDefaultReviewersValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+	}{
+		{"empty workspace", "", "repo"},
+		{"empty repo", "ws", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.GetEffectiveDefaultReviewers(context.Background(), tt.workspace, tt.repo)
+			if err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestListPullRequestComments(t *testing.T) {
+	var gotMethod, gotPath string
+	resolution := map[string]any{
+		"user":       map[string]any{"display_name": "Charlie"},
+		"created_on": "2024-01-15T10:00:00.000000+00:00",
+	}
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"values": []map[string]any{
+				{
+					"id":      1,
+					"content": map[string]string{"raw": "Looks good"},
+					"user": map[string]any{
+						"display_name": "Alice",
+						"nickname":     "alice",
+					},
+					"created_on": "2024-01-10T10:00:00.000000+00:00",
+					"updated_on": "2024-01-10T10:00:00.000000+00:00",
+					"resolution": nil,
+				},
+				{
+					"id":      2,
+					"content": map[string]string{"raw": "Fixed"},
+					"user": map[string]any{
+						"display_name": "Bob",
+						"nickname":     "bob",
+					},
+					"created_on": "2024-01-11T10:00:00.000000+00:00",
+					"updated_on": "2024-01-11T10:00:00.000000+00:00",
+					"resolution": resolution,
+				},
+				{
+					"id":      3,
+					"deleted": true,
+					"content": map[string]string{"raw": ""},
+					"user": map[string]any{
+						"display_name": "Deleted User",
+						"nickname":     "deleted",
+					},
+				},
+			},
+		})
+	}))
+
+	comments, err := client.ListPullRequestComments(context.Background(), "myworkspace", "my-repo", 42, 0)
+	if err != nil {
+		t.Fatalf("ListPullRequestComments: %v", err)
+	}
+	if gotMethod != "GET" {
+		t.Errorf("method = %s, want GET", gotMethod)
+	}
+	if gotPath != "/repositories/myworkspace/my-repo/pullrequests/42/comments" {
+		t.Errorf("path = %q, want /repositories/myworkspace/my-repo/pullrequests/42/comments", gotPath)
+	}
+	if len(comments) != 3 {
+		t.Fatalf("expected 3 comments, got %d", len(comments))
+	}
+	if comments[0].ID != 1 {
+		t.Errorf("comments[0].ID = %d, want 1", comments[0].ID)
+	}
+	if comments[0].Content.Raw != "Looks good" {
+		t.Errorf("comments[0].Content.Raw = %q, want %q", comments[0].Content.Raw, "Looks good")
+	}
+	if comments[0].User == nil {
+		t.Fatal("comments[0].User is nil")
+	}
+	if comments[0].User.DisplayName != "Alice" {
+		t.Errorf("comments[0].User.DisplayName = %q, want %q", comments[0].User.DisplayName, "Alice")
+	}
+	if comments[0].Resolution != nil {
+		t.Error("comments[0].Resolution should be nil")
+	}
+	if comments[1].Resolution == nil {
+		t.Fatal("comments[1].Resolution should not be nil")
+	}
+	if !comments[2].Deleted {
+		t.Fatal("comments[2].Deleted = false, want true")
+	}
+}
+
+func TestGetPullRequestComment(t *testing.T) {
+	var gotMethod, gotPath string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      9,
+			"deleted": true,
+			"content": map[string]string{"raw": ""},
+		})
+	}))
+
+	comment, err := client.GetPullRequestComment(context.Background(), "ws", "repo", 42, 9)
+	if err != nil {
+		t.Fatalf("GetPullRequestComment: %v", err)
+	}
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %s, want GET", gotMethod)
+	}
+	if gotPath != "/repositories/ws/repo/pullrequests/42/comments/9" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if comment.ID != 9 || !comment.Deleted {
+		t.Fatalf("comment = %+v, want id=9 deleted=true", comment)
+	}
+}
+
+func TestDeletePullRequestComment(t *testing.T) {
+	var gotMethod, gotPath string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	if err := client.DeletePullRequestComment(context.Background(), "ws", "repo", 42, 9); err != nil {
+		t.Fatalf("DeletePullRequestComment: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %s, want DELETE", gotMethod)
+	}
+	if gotPath != "/repositories/ws/repo/pullrequests/42/comments/9" {
+		t.Errorf("path = %q", gotPath)
+	}
+}
+
+func TestDeletePullRequestCommentErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"forbidden", http.StatusForbidden, `{"error":{"message":"Forbidden"}}`, "403 Forbidden: Forbidden"},
+		{"not found", http.StatusNotFound, `{"error":{"message":"Comment not found"}}`, "404 Not Found: Comment not found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+
+			err := client.DeletePullRequestComment(context.Background(), "ws", "repo", 42, 9)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if err.Error() != tt.want {
+				t.Fatalf("error = %q, want %q", err.Error(), tt.want)
+			}
+		})
+	}
+}
+
+func TestListPullRequestCommentsPaginates(t *testing.T) {
+	var hits int32
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		switch count {
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{{"id": 1, "content": map[string]string{"raw": "first"}}},
+				"next":   serverURL + "/repositories/ws/repo/pullrequests/1/comments?pagelen=100&page=2",
+			})
+		case 2:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{{"id": 2, "content": map[string]string{"raw": "second"}}},
+			})
+		default:
+			t.Fatalf("unexpected request %d", count)
+		}
+	}))
+	serverURL = server.URL
+	t.Cleanup(server.Close)
+
+	client, err := cloud.New(cloud.Options{BaseURL: server.URL, Username: "u", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	comments, err := client.ListPullRequestComments(context.Background(), "ws", "repo", 1, 0)
+	if err != nil {
+		t.Fatalf("ListPullRequestComments: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 comments, got %d", len(comments))
+	}
+	if hits != 2 {
+		t.Fatalf("expected 2 requests, got %d", hits)
+	}
+}
+
+func TestListPullRequestCommentsValidation(t *testing.T) {
+	client, err := cloud.New(cloud.Options{
+		BaseURL: "http://localhost", Username: "u", Token: "t",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		workspace string
+		repo      string
+	}{
+		{"empty workspace", "", "repo"},
+		{"empty repo", "ws", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.ListPullRequestComments(context.Background(), tt.workspace, tt.repo, 1, 0)
+			if err == nil {
+				t.Error("expected error")
+			}
+		})
+	}
+}
+
+func TestListPullRequestCommentsPagePreservesAndNormalizesNext(t *testing.T) {
+	var requests []string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"values": []map[string]any{{"id": len(requests), "content": map[string]any{"raw": "note"}}},
+			"next":   server.URL + "/repositories/team/repo/pullrequests/7/comments?pagelen=2&page=2",
+		})
+	}))
+	t.Cleanup(server.Close)
+	client, err := cloud.New(cloud.Options{BaseURL: server.URL, Token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := client.ListPullRequestCommentsPage(context.Background(), "team", "repo", 7, 2, "")
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(page.Values) != 1 || page.Next != "/repositories/team/repo/pullrequests/7/comments?pagelen=2&page=2" {
+		t.Fatalf("first page = %+v", page)
+	}
+	if _, err := client.ListPullRequestCommentsPage(context.Background(), "team", "repo", 7, 2, page.Next); err != nil {
+		t.Fatalf("next page: %v", err)
+	}
+	if len(requests) != 2 || requests[0] != "/repositories/team/repo/pullrequests/7/comments?pagelen=2" || requests[1] != "/repositories/team/repo/pullrequests/7/comments?pagelen=2&page=2" {
+		t.Fatalf("requests = %v", requests)
+	}
+}
+
+func TestListPullRequestCommentsPageRejectsForeignNext(t *testing.T) {
+	var requests atomic.Int32
+	client := newTestClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	_, err := client.ListPullRequestCommentsPage(context.Background(), "team", "repo", 7, 2, "https://evil.example/steal")
+	if err == nil || requests.Load() != 0 {
+		t.Fatalf("error = %v, requests = %d; want rejection before HTTP", err, requests.Load())
+	}
+}
+
+func TestGetPullRequestRetainsDestinationCommit(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": 7,
+			"destination": map[string]any{
+				"commit": map[string]any{"hash": "target-sha"},
+			},
+		})
+	}))
+	pr, err := client.GetPullRequest(context.Background(), "team", "repo", 7)
+	if err != nil {
+		t.Fatalf("GetPullRequest: %v", err)
+	}
+	if pr.Destination.Commit.Hash != "target-sha" {
+		t.Fatalf("destination commit = %q", pr.Destination.Commit.Hash)
+	}
+}
+
+func TestSetPullRequestCommentThreadResolved(t *testing.T) {
+	tests := []struct {
+		name       string
+		resolved   bool
+		wantMethod string
+		status     int
+		body       map[string]any
+	}{
+		{
+			name:       "resolve",
+			resolved:   true,
+			wantMethod: http.MethodPost,
+			status:     http.StatusOK,
+			body: map[string]any{
+				"user":       map[string]string{"display_name": "Alice"},
+				"created_on": "2026-01-01T00:00:00+00:00",
+			},
+		},
+		{
+			name:       "reopen",
+			resolved:   false,
+			wantMethod: http.MethodDelete,
+			status:     http.StatusNoContent,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotMethod, gotPath string
+			client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				if gotPath != "/repositories/ws/repo/pullrequests/42/comments/9/resolve" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				if tt.body != nil {
+					_ = json.NewEncoder(w).Encode(tt.body)
+				}
+			}))
+
+			resolution, err := client.SetPullRequestCommentThreadResolved(context.Background(), "ws", "repo", 42, 9, tt.resolved)
+			if err != nil {
+				t.Fatalf("SetPullRequestCommentThreadResolved: %v", err)
+			}
+			if gotMethod != tt.wantMethod {
+				t.Errorf("method = %s, want %s", gotMethod, tt.wantMethod)
+			}
+			if gotPath != "/repositories/ws/repo/pullrequests/42/comments/9/resolve" {
+				t.Errorf("path = %q", gotPath)
+			}
+			if tt.resolved {
+				if resolution == nil || (*resolution)["created_on"] == "" {
+					t.Fatalf("resolution = %#v, want decoded resolution", resolution)
+				}
+			} else if resolution != nil {
+				t.Fatalf("resolution = %#v, want nil", resolution)
+			}
+		})
+	}
+}
+
+func TestSetPullRequestCommentThreadResolvedErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"forbidden", http.StatusForbidden, `{"error":{"message":"Comment is not a top-level comment"}}`, "403 Forbidden: Comment is not a top-level comment"},
+		{"not found", http.StatusNotFound, `{"error":{"message":"Not found"}}`, "404 Not Found: Not found"},
+		{"conflict", http.StatusConflict, `{"error":{"message":"Already resolved"}}`, "409 Conflict: Already resolved"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+
+			_, err := client.SetPullRequestCommentThreadResolved(context.Background(), "ws", "repo", 42, 9, true)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if err.Error() != tt.want {
+				t.Fatalf("error = %q, want %q", err.Error(), tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdatePullRequest(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":    42,
+			"title": "Updated",
+			"state": "OPEN",
+		})
+	}))
+
+	title := "New Title"
+	pr, err := client.UpdatePullRequest(context.Background(), "ws", "repo", 42, cloud.UpdatePullRequestInput{
+		Title: &title,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotMethod != "PUT" {
+		t.Errorf("expected PUT, got %s", gotMethod)
+	}
+	if gotPath != "/repositories/ws/repo/pullrequests/42" {
+		t.Errorf("unexpected path: %s", gotPath)
+	}
+	if gotBody["title"] != "New Title" {
+		t.Errorf("expected title in body, got %v", gotBody)
+	}
+	if pr.ID != 42 {
+		t.Errorf("expected PR ID 42, got %d", pr.ID)
+	}
+}
+
+func TestUpdatePullRequestWithReviewers(t *testing.T) {
+	var gotBody map[string]any
+
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "title": "PR"})
+	}))
+
+	_, err := client.UpdatePullRequest(context.Background(), "ws", "repo", 1, cloud.UpdatePullRequestInput{
+		Reviewers: []string{"alice", "{550e8400-e29b-41d4-a716-446655440000}", "557058:12345678-1234-1234-1234-123456789abc"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	reviewers, ok := gotBody["reviewers"].([]any)
+	if !ok {
+		t.Fatalf("expected reviewers array, got %v", gotBody["reviewers"])
+	}
+	if len(reviewers) != 3 {
+		t.Fatalf("expected 3 reviewers, got %d", len(reviewers))
+	}
+
+	r0 := reviewers[0].(map[string]any)
+	if r0["username"] != "alice" {
+		t.Errorf("expected first reviewer by username, got %v", r0)
+	}
+	r1 := reviewers[1].(map[string]any)
+	if r1["uuid"] != "{550e8400-e29b-41d4-a716-446655440000}" {
+		t.Errorf("expected second reviewer by uuid, got %v", r1)
+	}
+	r2 := reviewers[2].(map[string]any)
+	if r2["account_id"] != "557058:12345678-1234-1234-1234-123456789abc" {
+		t.Errorf("expected third reviewer by account_id, got %v", r2)
+	}
+}
+
+func TestUpdatePullRequestReviewerAutoDetect(t *testing.T) {
+	tests := []struct {
+		name       string
+		reviewers  []string
+		wantFields []string
+	}{
+		{
+			name:       "uuid",
+			reviewers:  []string{"{550e8400-e29b-41d4-a716-446655440000}"},
+			wantFields: []string{"uuid"},
+		},
+		{
+			name:       "username",
+			reviewers:  []string{"alice"},
+			wantFields: []string{"username"},
+		},
+		{
+			name:       "account_id",
+			reviewers:  []string{"557058:12345678-1234-1234-1234-123456789abc"},
+			wantFields: []string{"account_id"},
+		},
+		{
+			name:       "mixed all three",
+			reviewers:  []string{"alice", "{550e8400-e29b-41d4-a716-446655440000}", "557058:12345678-1234-1234-1234-123456789abc"},
+			wantFields: []string{"username", "uuid", "account_id"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotBody map[string]any
+			client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&gotBody)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "title": "PR"})
+			}))
+
+			_, err := client.UpdatePullRequest(context.Background(), "ws", "repo", 1, cloud.UpdatePullRequestInput{
+				Reviewers: tt.reviewers,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			reviewers, ok := gotBody["reviewers"].([]any)
+			if !ok {
+				t.Fatal("reviewers missing from request body")
+			}
+			if len(reviewers) != len(tt.wantFields) {
+				t.Fatalf("expected %d reviewers, got %d", len(tt.wantFields), len(reviewers))
+			}
+			for i, field := range tt.wantFields {
+				rev := reviewers[i].(map[string]any)
+				if _, ok := rev[field]; !ok {
+					t.Errorf("reviewer[%d]: expected %q field, got keys %v", i, field, rev)
+				}
+			}
+		})
+	}
+}
+
+func TestUpdatePullRequestEmptyReviewers(t *testing.T) {
+	var gotBody map[string]any
+
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "title": "PR"})
+	}))
+
+	_, err := client.UpdatePullRequest(context.Background(), "ws", "repo", 1, cloud.UpdatePullRequestInput{
+		Reviewers: []string{},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	reviewers, ok := gotBody["reviewers"].([]any)
+	if !ok {
+		t.Fatalf("expected reviewers array, got %v", gotBody["reviewers"])
+	}
+	if len(reviewers) != 0 {
+		t.Errorf("expected empty reviewers array, got %d", len(reviewers))
+	}
+}
+
+func TestUpdatePullRequestValidation(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	_, err := client.UpdatePullRequest(context.Background(), "", "repo", 1, cloud.UpdatePullRequestInput{})
+	if err == nil || !strings.Contains(err.Error(), "workspace") {
+		t.Errorf("expected workspace validation error, got %v", err)
+	}
+
+	_, err = client.UpdatePullRequest(context.Background(), "ws", "repo", 1, cloud.UpdatePullRequestInput{})
+	if err == nil || !strings.Contains(err.Error(), "at least one field") {
+		t.Errorf("expected empty input error, got %v", err)
+	}
+}
+
+func TestListPullRequestsEncodesReviewerFilterUpstream(t *testing.T) {
+	var firstQuery string
+	var requests int32
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&requests, 1) == 1 {
+			firstQuery = r.URL.Query().Get("q")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": []any{}})
+	}))
+
+	uuid := "{a1b2c3d4-e5f6-4890-abcd-ef1234567890}"
+	if _, err := client.ListPullRequests(context.Background(), "ws", "repo", cloud.PullRequestListOptions{
+		Reviewer: uuid,
+		Limit:    10,
+	}); err != nil {
+		t.Fatalf("ListPullRequests: %v", err)
+	}
+	if want := `reviewers.uuid = "` + uuid + `"`; firstQuery != want {
+		t.Fatalf("first request q = %q, want %q (reviewer filter must be upstream, before any limiting)", firstQuery, want)
+	}
+
+	// Nickname identities use the username field.
+	atomic.StoreInt32(&requests, 0)
+	if _, err := client.ListPullRequests(context.Background(), "ws", "repo", cloud.PullRequestListOptions{
+		Reviewer: "nick",
+	}); err != nil {
+		t.Fatalf("ListPullRequests: %v", err)
+	}
+	if want := `reviewers.nickname = "nick"`; firstQuery != want {
+		t.Fatalf("q = %q, want %q", firstQuery, want)
+	}
+
+	// Author + reviewer combine with AND.
+	atomic.StoreInt32(&requests, 0)
+	if _, err := client.ListPullRequests(context.Background(), "ws", "repo", cloud.PullRequestListOptions{
+		Mine:     "nick",
+		Reviewer: uuid,
+	}); err != nil {
+		t.Fatalf("ListPullRequests: %v", err)
+	}
+	if want := `author.nickname = "nick" AND reviewers.uuid = "` + uuid + `"`; firstQuery != want {
+		t.Fatalf("q = %q, want %q", firstQuery, want)
+	}
+}
+
+func TestListRepoPullRequestsPageNextRoundTrip(t *testing.T) {
+	var paths []string
+	var server *httptest.Server
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		if len(paths) == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{{"id": 1}},
+				"next":   server.URL + "/repositories/ws/repo/pullrequests?page=2&pagelen=1",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": []map[string]any{{"id": 2}}})
+	})
+	server = httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client, err := cloud.New(cloud.Options{BaseURL: server.URL, Username: "u", Token: "t"})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	first, err := client.ListRepoPullRequestsPage(context.Background(), "ws", "repo", cloud.PullRequestListOptions{Limit: 1}, "")
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if first.Next == "" {
+		t.Fatal("first page must expose Next")
+	}
+	second, err := client.ListRepoPullRequestsPage(context.Background(), "ws", "repo", cloud.PullRequestListOptions{}, first.Next)
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if second.Next != "" {
+		t.Fatal("second page must be last")
+	}
+	if len(paths) != 2 || !strings.Contains(paths[1], "page=2") {
+		t.Fatalf("paths = %v, want second request to follow the opaque next reference", paths)
+	}
+}
+
+func TestPullRequestPagesStateAllRepeatsEverySupportedState(t *testing.T) {
+	var gotStates [][]string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotStates = append(gotStates, r.URL.Query()["state"])
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": []any{}})
+	}))
+
+	if _, err := client.ListRepoPullRequestsPage(context.Background(), "ws", "repo", cloud.PullRequestListOptions{State: "ALL", Limit: 25}, ""); err != nil {
+		t.Fatalf("ListRepoPullRequestsPage: %v", err)
+	}
+	if _, err := client.ListWorkspacePullRequestsPage(context.Background(), "ws", "alice", cloud.WorkspacePullRequestsOptions{State: "all", Limit: 25}, ""); err != nil {
+		t.Fatalf("ListWorkspacePullRequestsPage: %v", err)
+	}
+	for i, states := range gotStates {
+		if got := strings.Join(states, ","); got != "OPEN,MERGED,DECLINED" {
+			t.Fatalf("request %d states = %q, want repeated OPEN,MERGED,DECLINED", i+1, got)
+		}
+	}
+}
+
+func TestListWorkspacePullRequestsPageIsAuthorScoped(t *testing.T) {
+	var gotPath string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": []any{}})
+	}))
+
+	if _, err := client.ListWorkspacePullRequestsPage(context.Background(), "ws", "alice", cloud.WorkspacePullRequestsOptions{State: "open", Limit: 5}, ""); err != nil {
+		t.Fatalf("ListWorkspacePullRequestsPage: %v", err)
+	}
+	if !strings.HasSuffix(gotPath, "/workspaces/ws/pullrequests/alice") {
+		t.Fatalf("path = %q, want the user-scoped author endpoint", gotPath)
+	}
+}
+
+// Regression for credential exfiltration: a caller-supplied next reference
+// pointing at another host must never be fetched with the Bitbucket
+// Authorization header. The reference is reduced to its request URI (same
+// client host) and must target the original endpoint.
+func TestListRepoPullRequestsPageRejectsForeignNextHost(t *testing.T) {
+	var attackerHits int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attackerHits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(attacker.Close)
+
+	var apiPaths []string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiPaths = append(apiPaths, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": []any{}})
+	}))
+
+	// Absolute foreign URL with a plausible path: host must be stripped, the
+	// request must go to the client's own base host.
+	foreign := attacker.URL + "/repositories/ws/repo/pullrequests?page=2"
+	if _, err := client.ListRepoPullRequestsPage(context.Background(), "ws", "repo", cloud.PullRequestListOptions{}, foreign); err != nil {
+		t.Fatalf("normalized foreign next: %v", err)
+	}
+	if got := atomic.LoadInt32(&attackerHits); got != 0 {
+		t.Fatalf("attacker host received %d requests; credential exfiltration", got)
+	}
+	if len(apiPaths) != 1 || !strings.Contains(apiPaths[0], "/repositories/ws/repo/pullrequests") {
+		t.Fatalf("api paths = %v, want the normalized same-host request", apiPaths)
+	}
+
+	// A next reference targeting a different endpoint must be rejected
+	// without any request.
+	apiPaths = nil
+	if _, err := client.ListRepoPullRequestsPage(context.Background(), "ws", "repo", cloud.PullRequestListOptions{}, attacker.URL+"/2.0/user"); err == nil || !strings.Contains(err.Error(), "does not target") {
+		t.Fatalf("foreign endpoint: err = %v, want endpoint rejection", err)
+	}
+	if len(apiPaths) != 0 || atomic.LoadInt32(&attackerHits) != 0 {
+		t.Fatalf("rejected reference still produced requests (api=%v attacker=%d)", apiPaths, attackerHits)
+	}
+}
+
+func TestListWorkspacePullRequestsPageRejectsForeignNext(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("no request expected for a rejected next reference")
+	}))
+	if _, err := client.ListWorkspacePullRequestsPage(context.Background(), "ws", "alice", cloud.WorkspacePullRequestsOptions{}, "https://evil.example/steal"); err == nil || !strings.Contains(err.Error(), "does not target") {
+		t.Fatalf("err = %v, want endpoint rejection", err)
+	}
+}
+
+// Endpoint binding must be terminal, not substring containment: a same-host
+// path that merely contains the endpoint (trailing extra segment or a glued
+// prefix) is rejected, while a legitimate /2.0-prefixed reference round-trips.
+func TestNormalizeNextRefEnforcesTerminalEndpoint(t *testing.T) {
+	var apiPaths []string
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiPaths = append(apiPaths, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"values": []any{}})
+	}))
+	base := client // same-host references are built from the test server URL below
+
+	// Legitimate base-path-prefixed next reference round-trips.
+	if _, err := base.ListRepoPullRequestsPage(context.Background(), "ws", "repo", cloud.PullRequestListOptions{}, "/2.0/repositories/ws/repo/pullrequests?page=2"); err != nil {
+		t.Fatalf("valid /2.0 next reference rejected: %v", err)
+	}
+	if len(apiPaths) != 1 {
+		t.Fatalf("valid reference produced %d requests, want 1", len(apiPaths))
+	}
+
+	// Trailing extra segment (containment, not endpoint identity) rejected.
+	apiPaths = nil
+	if _, err := base.ListRepoPullRequestsPage(context.Background(), "ws", "repo", cloud.PullRequestListOptions{}, "/repositories/ws/repo/pullrequests/1"); err == nil || !strings.Contains(err.Error(), "does not target") {
+		t.Fatalf("trailing-segment reference: err = %v, want rejection", err)
+	}
+	// Glued prefix (no segment boundary) rejected.
+	if _, err := base.ListRepoPullRequestsPage(context.Background(), "ws", "repo", cloud.PullRequestListOptions{}, "/evilrepositories/ws/repo/pullrequests"); err == nil || !strings.Contains(err.Error(), "does not target") {
+		t.Fatalf("glued-prefix reference: err = %v, want rejection", err)
+	}
+	if len(apiPaths) != 0 {
+		t.Fatalf("rejected references still issued %d requests", len(apiPaths))
+	}
+}

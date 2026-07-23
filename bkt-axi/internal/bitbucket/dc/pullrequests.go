@@ -1,0 +1,703 @@
+package dc
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"strings"
+)
+
+// ErrPullRequestCommentNotTopLevel is returned when a thread-level operation is
+// attempted on a reply instead of the thread's top-level comment.
+var ErrPullRequestCommentNotTopLevel = errors.New("only top-level pull request comment threads can be changed")
+
+// PullRequestReviewer represents a reviewer assignment.
+type PullRequestReviewer struct {
+	User     User   `json:"user"`
+	Role     string `json:"role,omitempty"`
+	Status   string `json:"status,omitempty"`
+	Approved *bool  `json:"approved,omitempty"`
+}
+
+// PullRequestParticipant wraps a reviewer/participant entry.
+type PullRequestParticipant struct {
+	User     User   `json:"user"`
+	Role     string `json:"role"`
+	Status   string `json:"status"`
+	Approved bool   `json:"approved"`
+}
+
+// PullRequestComment represents a PR comment.
+type PullRequestComment struct {
+	ID             int            `json:"id"`
+	Version        int            `json:"version"`
+	Text           string         `json:"text"`
+	CreatedDate    *int64         `json:"createdDate,omitempty"`
+	Severity       string         `json:"severity"` // "NORMAL" or "BLOCKER" (task)
+	State          string         `json:"state"`    // "OPEN" or "RESOLVED"
+	Properties     map[string]any `json:"properties,omitempty"`
+	Author         User           `json:"author"`
+	ThreadResolved bool           `json:"threadResolved"`
+	Parent         *struct {
+		ID int `json:"id"`
+	} `json:"parent,omitempty"`
+	Anchor   *PullRequestCommentAnchor `json:"anchor,omitempty"`
+	Comments []PullRequestComment      `json:"comments,omitempty"`
+	Depth    int                       `json:"-"` // nesting depth, set during flattening
+	raw      map[string]any
+}
+
+type PullRequestCommentAnchor struct {
+	Path     string `json:"path"`
+	Line     int    `json:"line"`
+	LineType string `json:"lineType"`
+	FileType string `json:"fileType"`
+}
+
+func (a *PullRequestCommentAnchor) UnmarshalJSON(data []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if value, ok := raw["path"]; ok {
+		a.Path = commentAnchorPath(value)
+	}
+	if value, ok := raw["line"].(float64); ok {
+		a.Line = int(value)
+	}
+	if value, ok := raw["lineType"].(string); ok {
+		a.LineType = value
+	}
+	if value, ok := raw["fileType"].(string); ok {
+		a.FileType = value
+	}
+	return nil
+}
+
+func commentAnchorPath(value any) string {
+	switch path := value.(type) {
+	case string:
+		return path
+	case map[string]any:
+		if parent, _ := path["parent"].(string); parent != "" {
+			if name, _ := path["name"].(string); name != "" {
+				return strings.TrimSuffix(parent, "/") + "/" + name
+			}
+			return parent
+		}
+		if components, ok := path["components"].([]any); ok {
+			parts := make([]string, 0, len(components))
+			for _, component := range components {
+				if s, ok := component.(string); ok && s != "" {
+					parts = append(parts, s)
+				}
+			}
+			if len(parts) > 0 {
+				return strings.Join(parts, "/")
+			}
+		}
+		if name, _ := path["name"].(string); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// UnmarshalJSON keeps the typed fields used by callers while preserving the
+// mutable comment fields needed by Bitbucket's update-comment endpoint.
+func (c *PullRequestComment) UnmarshalJSON(data []byte) error {
+	type alias PullRequestComment
+	var parsed alias
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*c = PullRequestComment(parsed)
+	c.raw = raw
+	return nil
+}
+
+// pullRequestActivity represents a single entry from the PR activities endpoint.
+type pullRequestActivity struct {
+	Action  string              `json:"action"`
+	Comment *PullRequestComment `json:"comment,omitempty"`
+}
+
+// PullRequestCommentsPage is one page of comments extracted from the Data
+// Center pull request activities endpoint. Pagination metadata refers to the
+// upstream activity page, which may also contain non-comment activities.
+type PullRequestCommentsPage struct {
+	Values    []PullRequestComment
+	IsLast    bool
+	NextStart int
+}
+
+// ListPullRequestCommentsPage fetches one upstream activity page and extracts
+// its comments without following pagination.
+func (c *Client) ListPullRequestCommentsPage(ctx context.Context, projectKey, repoSlug string, prID, limit, start int) (*PullRequestCommentsPage, error) {
+	if projectKey == "" || repoSlug == "" {
+		return nil, fmt.Errorf("project key and repository slug are required")
+	}
+	if prID <= 0 {
+		return nil, fmt.Errorf("pull request id must be positive")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	if start < 0 {
+		return nil, fmt.Errorf("page start must not be negative")
+	}
+
+	u := fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/activities?limit=%d&start=%d",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+		limit,
+		start,
+	)
+	req, err := c.http.NewRequest(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp paged[pullRequestActivity]
+	if err := c.http.Do(req, &resp); err != nil {
+		return nil, err
+	}
+
+	comments := make([]PullRequestComment, 0, len(resp.Values))
+	for _, activity := range resp.Values {
+		if activity.Action == "COMMENTED" && activity.Comment != nil {
+			comments = append(comments, flattenComments(*activity.Comment, 0)...)
+		}
+	}
+	return &PullRequestCommentsPage{
+		Values:    comments,
+		IsLast:    resp.IsLastPage,
+		NextStart: resp.NextPageStart,
+	}, nil
+}
+
+// ListPullRequestComments lists comments on a pull request via the activities endpoint.
+func (c *Client) ListPullRequestComments(ctx context.Context, projectKey, repoSlug string, prID int) ([]PullRequestComment, error) {
+	if projectKey == "" || repoSlug == "" {
+		return nil, fmt.Errorf("project key and repository slug are required")
+	}
+
+	const defaultPageSize = 100
+
+	var (
+		start = 0
+		all   []PullRequestComment
+	)
+
+	for {
+		u := fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/activities?limit=%d&start=%d",
+			url.PathEscape(projectKey),
+			url.PathEscape(repoSlug),
+			prID,
+			defaultPageSize,
+			start,
+		)
+		req, err := c.http.NewRequest(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var resp paged[pullRequestActivity]
+		if err := c.http.Do(req, &resp); err != nil {
+			return nil, err
+		}
+
+		for _, a := range resp.Values {
+			if a.Action == "COMMENTED" && a.Comment != nil {
+				all = append(all, flattenComments(*a.Comment, 0)...)
+			}
+		}
+
+		if resp.IsLastPage || len(resp.Values) == 0 {
+			break
+		}
+		start = resp.NextPageStart
+	}
+
+	return all, nil
+}
+
+// SetPullRequestCommentThreadResolved resolves or reopens a top-level pull
+// request comment thread.
+func (c *Client) SetPullRequestCommentThreadResolved(ctx context.Context, projectKey, repoSlug string, prID, commentID int, resolved bool) (*PullRequestComment, error) {
+	if projectKey == "" || repoSlug == "" {
+		return nil, fmt.Errorf("project key and repository slug are required")
+	}
+	if prID <= 0 {
+		return nil, fmt.Errorf("pull request id must be positive")
+	}
+	if commentID <= 0 {
+		return nil, fmt.Errorf("comment id must be positive")
+	}
+
+	comments, err := c.ListPullRequestComments(ctx, projectKey, repoSlug, prID)
+	if err != nil {
+		return nil, err
+	}
+
+	current, err := findPullRequestComment(comments, commentID)
+	if err != nil {
+		return nil, err
+	}
+	if current.Depth > 0 {
+		return nil, ErrPullRequestCommentNotTopLevel
+	}
+	if current.ThreadResolved == resolved {
+		return current, nil
+	}
+
+	body := current.updatePayload(resolved)
+	path := fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+		commentID,
+	)
+	req, err := c.http.NewRequest(ctx, "PUT", path, body)
+	if err != nil {
+		return nil, err
+	}
+
+	var updated PullRequestComment
+	if err := c.http.Do(req, &updated); err != nil {
+		return nil, err
+	}
+	if updated.ID == 0 {
+		updated = *current
+		updated.ThreadResolved = resolved
+	}
+	return &updated, nil
+}
+
+func (c PullRequestComment) updatePayload(resolved bool) map[string]any {
+	body := map[string]any{}
+	for _, key := range []string{"anchor", "comments", "id", "properties", "severity", "state", "text", "version"} {
+		if value, ok := c.raw[key]; ok {
+			body[key] = value
+		}
+	}
+	if _, ok := body["id"]; !ok {
+		body["id"] = c.ID
+	}
+	if _, ok := body["version"]; !ok {
+		body["version"] = c.Version
+	}
+	if _, ok := body["text"]; !ok {
+		body["text"] = c.Text
+	}
+	if _, ok := body["severity"]; !ok {
+		body["severity"] = c.Severity
+	}
+	if _, ok := body["state"]; !ok {
+		body["state"] = c.State
+	}
+	if _, ok := body["properties"]; !ok {
+		if c.Properties != nil {
+			body["properties"] = c.Properties
+		} else {
+			body["properties"] = map[string]any{}
+		}
+	}
+	body["threadResolved"] = resolved
+	return body
+}
+
+func findPullRequestComment(comments []PullRequestComment, commentID int) (*PullRequestComment, error) {
+	for i := range comments {
+		if comments[i].ID == commentID {
+			return &comments[i], nil
+		}
+	}
+	return nil, fmt.Errorf("pull request comment %d not found", commentID)
+}
+
+// DeletePullRequestComment deletes a pull request comment.
+func (c *Client) DeletePullRequestComment(ctx context.Context, projectKey, repoSlug string, prID, commentID int) error {
+	if projectKey == "" || repoSlug == "" {
+		return fmt.Errorf("project key and repository slug are required")
+	}
+	if prID <= 0 {
+		return fmt.Errorf("pull request id must be positive")
+	}
+	if commentID <= 0 {
+		return fmt.Errorf("comment id must be positive")
+	}
+
+	comments, err := c.ListPullRequestComments(ctx, projectKey, repoSlug, prID)
+	if err != nil {
+		return err
+	}
+	current, err := findPullRequestComment(comments, commentID)
+	if err != nil {
+		return err
+	}
+
+	query := url.Values{}
+	query.Set("version", fmt.Sprint(current.Version))
+	path := fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments/%d?%s",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+		commentID,
+		query.Encode(),
+	)
+	req, err := c.http.NewRequest(ctx, "DELETE", path, nil)
+	if err != nil {
+		return err
+	}
+	return c.http.Do(req, nil)
+}
+
+// flattenComments walks a comment tree depth-first, returning a flat slice
+// with Depth set on each node.
+func flattenComments(c PullRequestComment, depth int) []PullRequestComment {
+	children := c.Comments
+	c.Comments = nil
+	c.Depth = depth
+	out := []PullRequestComment{c}
+	for _, child := range children {
+		out = append(out, flattenComments(child, depth+1)...)
+	}
+	return out
+}
+
+// CreatePROptions configures pull request creation.
+type CreatePROptions struct {
+	Title            string
+	Description      string
+	SourceBranch     string
+	TargetBranch     string
+	SourceProjectKey string
+	SourceRepoSlug   string
+	Reviewers        []string
+	CloseSource      bool
+	Draft            bool
+}
+
+// CreatePullRequest creates a pull request between branches.
+func (c *Client) CreatePullRequest(ctx context.Context, projectKey, repoSlug string, opts CreatePROptions) (*PullRequest, error) {
+	if projectKey == "" || repoSlug == "" {
+		return nil, fmt.Errorf("project key and repository slug are required")
+	}
+	if opts.SourceBranch == "" || opts.TargetBranch == "" {
+		return nil, fmt.Errorf("source and target branches are required")
+	}
+	if opts.Title == "" {
+		return nil, fmt.Errorf("title is required")
+	}
+
+	sourceProjectKey := projectKey
+	if opts.SourceProjectKey != "" {
+		sourceProjectKey = opts.SourceProjectKey
+	}
+	sourceRepoSlug := repoSlug
+	if opts.SourceRepoSlug != "" {
+		sourceRepoSlug = opts.SourceRepoSlug
+	}
+
+	body := map[string]any{
+		"title":       opts.Title,
+		"description": opts.Description,
+		"fromRef": map[string]any{
+			"id": ensureRef(opts.SourceBranch),
+			"repository": map[string]any{
+				"slug":    sourceRepoSlug,
+				"project": map[string]any{"key": strings.ToUpper(sourceProjectKey)},
+			},
+		},
+		"toRef": map[string]any{
+			"id": ensureRef(opts.TargetBranch),
+			"repository": map[string]any{
+				"slug":    repoSlug,
+				"project": map[string]any{"key": strings.ToUpper(projectKey)},
+			},
+		},
+		"closeSourceBranch": opts.CloseSource,
+		"draft":             opts.Draft,
+	}
+
+	if len(opts.Reviewers) > 0 {
+		reviewers := make([]map[string]any, 0, len(opts.Reviewers))
+		for _, reviewer := range opts.Reviewers {
+			reviewers = append(reviewers, map[string]any{
+				"user": map[string]string{"name": reviewer},
+			})
+		}
+		body["reviewers"] = reviewers
+	}
+
+	req, err := c.http.NewRequest(ctx, "POST", fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+	), body)
+	if err != nil {
+		return nil, err
+	}
+
+	var pr PullRequest
+	if err := c.http.Do(req, &pr); err != nil {
+		return nil, err
+	}
+	return &pr, nil
+}
+
+// MergePROptions controls pull request merges.
+type MergePROptions struct {
+	Message           string
+	Strategy          string
+	CloseSourceBranch bool
+}
+
+// MergePullRequest merges the pull request.
+func (c *Client) MergePullRequest(ctx context.Context, projectKey, repoSlug string, prID int, version int, opts MergePROptions) error {
+	if projectKey == "" || repoSlug == "" {
+		return fmt.Errorf("project key and repository slug are required")
+	}
+
+	body := map[string]any{
+		"version":           version,
+		"message":           opts.Message,
+		"closeSourceBranch": opts.CloseSourceBranch,
+	}
+	if opts.Strategy != "" {
+		body["mergeStrategyId"] = opts.Strategy
+	}
+
+	req, err := c.http.NewRequest(ctx, "POST", fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/merge",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+	), body)
+	if err != nil {
+		return err
+	}
+
+	return c.http.Do(req, nil)
+}
+
+// ApprovePullRequest records an approval for the current token.
+func (c *Client) ApprovePullRequest(ctx context.Context, projectKey, repoSlug string, prID int) error {
+	req, err := c.http.NewRequest(ctx, "POST", fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/approve",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+	), nil)
+	if err != nil {
+		return err
+	}
+	return c.http.Do(req, nil)
+}
+
+// CommentOptions configures a pull request comment.
+type CommentOptions struct {
+	Text     string
+	ParentID int
+	File     string
+	FromLine int
+	ToLine   int
+	Pending  bool
+}
+
+// CommentPullRequest adds a comment to the pull request.
+// When ParentID > 0, the comment is a threaded reply.
+// When File is set with FromLine or ToLine, the comment targets a specific diff line.
+func (c *Client) CommentPullRequest(ctx context.Context, projectKey, repoSlug string, prID int, opts CommentOptions) error {
+	if strings.TrimSpace(opts.Text) == "" {
+		return fmt.Errorf("comment text is required")
+	}
+
+	body := map[string]any{"text": opts.Text}
+	if opts.Pending {
+		body["state"] = "PENDING"
+	}
+	if opts.ParentID > 0 {
+		body["parent"] = map[string]int{"id": opts.ParentID}
+	}
+	if opts.File != "" {
+		anchor := map[string]any{"path": opts.File}
+		if opts.ToLine > 0 {
+			anchor["line"] = opts.ToLine
+			anchor["lineType"] = "ADDED"
+			anchor["fileType"] = "TO"
+		}
+		if opts.FromLine > 0 {
+			anchor["line"] = opts.FromLine
+			anchor["lineType"] = "REMOVED"
+			anchor["fileType"] = "FROM"
+		}
+		body["anchor"] = anchor
+	}
+
+	req, err := c.http.NewRequest(ctx, "POST", fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/comments",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+	), body)
+	if err != nil {
+		return err
+	}
+	return c.http.Do(req, nil)
+}
+
+// UpdatePROptions configures pull request updates.
+type UpdatePROptions struct {
+	Title       string
+	Description string
+	// Draft toggles draft status. Nil means do not change.
+	Draft *bool
+	// Reviewers to preserve (from GET response). If nil, reviewers may be cleared.
+	Reviewers []PullRequestReviewer
+	// FromRef to preserve (from GET response). Required by DC API.
+	FromRef *Ref
+	// ToRef to preserve (from GET response). Required by DC API.
+	ToRef *Ref
+}
+
+// UpdatePullRequest updates an existing pull request's title and/or description.
+// Requires the current PR version for optimistic locking.
+// Note: DC's PUT endpoint replaces the entire PR; include Reviewers/FromRef/ToRef
+// from the GET response to prevent them from being cleared.
+func (c *Client) UpdatePullRequest(ctx context.Context, projectKey, repoSlug string, prID int, version int, opts UpdatePROptions) (*PullRequest, error) {
+	if projectKey == "" || repoSlug == "" {
+		return nil, fmt.Errorf("project key and repository slug are required")
+	}
+
+	body := map[string]any{
+		"version":     version,
+		"title":       opts.Title,
+		"description": opts.Description,
+	}
+
+	if opts.Draft != nil {
+		body["draft"] = *opts.Draft
+	}
+
+	// Include reviewers to prevent them from being cleared
+	if opts.Reviewers != nil {
+		body["reviewers"] = opts.Reviewers
+	}
+
+	// Include refs to prevent API errors (DC may require these)
+	if opts.FromRef != nil {
+		fromRefBody := map[string]any{
+			"id": opts.FromRef.ID,
+			"repository": map[string]any{
+				"slug": opts.FromRef.Repository.Slug,
+			},
+		}
+		if opts.FromRef.Repository.Project != nil {
+			fromRefBody["repository"].(map[string]any)["project"] = map[string]any{"key": opts.FromRef.Repository.Project.Key}
+		}
+		body["fromRef"] = fromRefBody
+	}
+	if opts.ToRef != nil {
+		toRefBody := map[string]any{
+			"id": opts.ToRef.ID,
+			"repository": map[string]any{
+				"slug": opts.ToRef.Repository.Slug,
+			},
+		}
+		if opts.ToRef.Repository.Project != nil {
+			toRefBody["repository"].(map[string]any)["project"] = map[string]any{"key": opts.ToRef.Repository.Project.Key}
+		}
+		body["toRef"] = toRefBody
+	}
+
+	req, err := c.http.NewRequest(ctx, "PUT", fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+	), body)
+	if err != nil {
+		return nil, err
+	}
+
+	var pr PullRequest
+	if err := c.http.Do(req, &pr); err != nil {
+		return nil, err
+	}
+	return &pr, nil
+}
+
+// DeclinePullRequest declines (rejects) a pull request.
+// An optional comment text may be provided; leave empty to omit it.
+func (c *Client) DeclinePullRequest(ctx context.Context, projectKey, repoSlug string, prID int, version int, comment string) error {
+	if projectKey == "" || repoSlug == "" {
+		return fmt.Errorf("project key and repository slug are required")
+	}
+
+	body := map[string]any{
+		"version": version,
+	}
+	if comment != "" {
+		body["comment"] = comment
+	}
+
+	req, err := c.http.NewRequest(ctx, "POST", fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/decline",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+	), body)
+	if err != nil {
+		return err
+	}
+
+	return c.http.Do(req, nil)
+}
+
+// ReopenPullRequest reopens a previously declined pull request.
+func (c *Client) ReopenPullRequest(ctx context.Context, projectKey, repoSlug string, prID int, version int) error {
+	if projectKey == "" || repoSlug == "" {
+		return fmt.Errorf("project key and repository slug are required")
+	}
+
+	body := map[string]any{
+		"version": version,
+	}
+
+	req, err := c.http.NewRequest(ctx, "POST", fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/reopen",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		prID,
+	), body)
+	if err != nil {
+		return err
+	}
+
+	return c.http.Do(req, nil)
+}
+
+// PullRequestDiff streams the diff for the given pull request into w.
+func (c *Client) PullRequestDiff(ctx context.Context, projectKey, repoSlug string, id int, w io.Writer) error {
+	if projectKey == "" || repoSlug == "" {
+		return fmt.Errorf("project key and repository slug are required")
+	}
+	if w == nil {
+		return fmt.Errorf("writer is required")
+	}
+
+	req, err := c.http.NewRequest(ctx, "GET", fmt.Sprintf("/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/diff",
+		url.PathEscape(projectKey),
+		url.PathEscape(repoSlug),
+		id,
+	), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/plain")
+
+	return c.http.Do(req, w)
+}

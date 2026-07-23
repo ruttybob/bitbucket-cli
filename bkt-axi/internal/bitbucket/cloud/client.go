@@ -1,0 +1,861 @@
+package cloud
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/ruttybob/bkt-axi/internal/bitbucket/httpx"
+	"github.com/ruttybob/bkt-axi/internal/types"
+)
+
+// Options configure the Bitbucket Cloud client.
+type Options struct {
+	BaseURL           string
+	Username          string
+	Token             string
+	Workspace         string
+	AuthMethod        string // "basic" (default) or "bearer"
+	EnableCache       bool
+	Retry             httpx.RetryPolicy
+	MergePollInterval time.Duration
+	TokenRefresher    func(ctx context.Context) (string, error)
+}
+
+// Client wraps Bitbucket Cloud REST endpoints.
+type Client struct {
+	http              *httpx.Client
+	mergePollInterval time.Duration
+}
+
+// HTTP exposes the underlying HTTP client for advanced scenarios.
+func (c *Client) HTTP() *httpx.Client {
+	return c.http
+}
+
+// New constructs a Bitbucket Cloud client.
+func New(opts Options) (*Client, error) {
+	if opts.BaseURL == "" {
+		opts.BaseURL = "https://api.bitbucket.org/2.0"
+	}
+
+	authMethod := opts.AuthMethod
+	if authMethod == "" && opts.TokenRefresher != nil {
+		authMethod = "bearer"
+	}
+	httpClient, err := httpx.New(httpx.Options{
+		BaseURL:        opts.BaseURL,
+		Username:       opts.Username,
+		Password:       opts.Token,
+		AuthMethod:     authMethod,
+		UserAgent:      "bkt-cli",
+		EnableCache:    opts.EnableCache,
+		Retry:          opts.Retry,
+		TokenRefresher: opts.TokenRefresher,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	mergePollInterval := opts.MergePollInterval
+	if mergePollInterval <= 0 {
+		mergePollInterval = 2 * time.Second
+	}
+
+	return &Client{
+		http:              httpClient,
+		mergePollInterval: mergePollInterval,
+	}, nil
+}
+
+// User represents a Bitbucket Cloud user profile.
+type User struct {
+	UUID      string `json:"uuid"`
+	Username  string `json:"username"`
+	Nickname  string `json:"nickname,omitempty"`
+	AccountID string `json:"account_id"`
+	Display   string `json:"display_name"`
+}
+
+// CurrentUser retrieves the authenticated user.
+func (c *Client) CurrentUser(ctx context.Context) (*User, error) {
+	req, err := c.http.NewRequest(ctx, "GET", "/user", nil)
+	if err != nil {
+		return nil, err
+	}
+	var user User
+	if err := c.http.Do(req, &user); err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+// Repository identifies a Bitbucket Cloud repository.
+type Repository struct {
+	UUID      string `json:"uuid"`
+	Name      string `json:"name"`
+	Slug      string `json:"slug"`
+	SCM       string `json:"scm"`
+	IsPrivate bool   `json:"is_private"`
+	Links     struct {
+		Clone []struct {
+			Href string `json:"href"`
+			Name string `json:"name"`
+		} `json:"clone"`
+		HTML struct {
+			Href string `json:"href"`
+		} `json:"html"`
+	} `json:"links"`
+	Workspace struct {
+		Slug string `json:"slug"`
+	} `json:"workspace"`
+	Project struct {
+		Key string `json:"key"`
+	} `json:"project"`
+	MainBranch struct {
+		Name string `json:"name"`
+	} `json:"mainbranch,omitempty"`
+}
+
+// PipelineResult is a Bitbucket pipeline outcome object.
+type PipelineResult struct {
+	Name string `json:"name"`
+}
+
+// PipelineState is the nested state object returned by Bitbucket for pipeline runs
+// and for individual pipeline steps (phase in Name, outcome in Result when finished).
+type PipelineState struct {
+	Result PipelineResult `json:"result"`
+	Stage  struct {
+		Name string `json:"name"`
+	} `json:"stage"`
+	Name string `json:"name"`
+}
+
+// Pipeline represents a pipeline execution.
+type Pipeline struct {
+	UUID        string        `json:"uuid"`
+	BuildNumber int           `json:"build_number"`
+	State       PipelineState `json:"state"`
+	Target      struct {
+		Type string `json:"type"`
+		Ref  struct {
+			Name string `json:"name"`
+		} `json:"ref"`
+	} `json:"target"`
+	CreatedOn   string `json:"created_on"`
+	CompletedOn string `json:"completed_on"`
+}
+
+// NormalizeUUID wraps a canonical UUID in curly braces, as required by the
+// Bitbucket Cloud API. Invalid inputs return an empty string.
+func NormalizeUUID(uuid string) string {
+	uuid = strings.TrimSpace(uuid)
+	if !LooksLikeUUID(uuid) {
+		return ""
+	}
+	uuid = strings.Trim(uuid, "{}")
+	return "{" + uuid + "}"
+}
+
+func normalizeUUIDArg(label, value string) (string, error) {
+	normalized := NormalizeUUID(value)
+	if normalized == "" {
+		return "", fmt.Errorf("%s must be a canonical UUID", label)
+	}
+	return normalized, nil
+}
+
+// uuidPattern matches canonical UUIDs (8-4-4-4-12 hex segments), either bare
+// or fully wrapped in curly braces. Half-braced inputs are rejected.
+var uuidPattern = regexp.MustCompile(`^(?:\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$`)
+
+// LooksLikeUUID returns true if s is a canonical UUID, optionally wrapped in
+// curly braces. Bitbucket Cloud usernames contain alphanumerics, underscores,
+// and dots, so they never match this pattern.
+func LooksLikeUUID(s string) bool {
+	return uuidPattern.MatchString(strings.TrimSpace(s))
+}
+
+// accountIDPattern matches Atlassian Account IDs: a numeric prefix, a colon,
+// then a UUID (e.g. "557058:12345678-1234-1234-1234-123456789abc").
+var accountIDPattern = regexp.MustCompile(`^\d+:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// LooksLikeAccountID returns true if s matches the Atlassian Account ID
+// format (numeric prefix + colon + UUID).
+func LooksLikeAccountID(s string) bool {
+	return accountIDPattern.MatchString(strings.TrimSpace(s))
+}
+
+// PipelinePage encapsulates paginated pipeline results.
+type PipelinePage struct {
+	Values []Pipeline `json:"values"`
+	Next   string     `json:"next"`
+}
+
+// ListPipelines lists recent pipelines.
+func (c *Client) ListPipelines(ctx context.Context, workspace, repoSlug string, limit int) ([]Pipeline, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+
+	pageLen := limit
+	if pageLen <= 0 || pageLen > 100 {
+		pageLen = 20
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s/pipelines/?pagelen=%d&sort=-created_on",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+		pageLen,
+	)
+
+	var pipelines []Pipeline
+
+	for path != "" {
+		req, err := c.http.NewRequest(ctx, "GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var page PipelinePage
+		if err := c.http.Do(req, &page); err != nil {
+			return nil, err
+		}
+
+		pipelines = append(pipelines, page.Values...)
+
+		if limit > 0 && len(pipelines) >= limit {
+			pipelines = pipelines[:limit]
+			break
+		}
+
+		if page.Next == "" {
+			break
+		}
+
+		nextURL, err := url.Parse(page.Next)
+		if err != nil {
+			return nil, err
+		}
+		if nextURL.IsAbs() {
+			if uri := nextURL.RequestURI(); uri != "" {
+				path = uri
+			} else {
+				path = nextURL.String()
+			}
+		} else {
+			path = nextURL.String()
+		}
+	}
+
+	return pipelines, nil
+}
+
+// RepositoryListPage encapsulates paginated repository responses.
+type repositoryListPage struct {
+	Values []Repository `json:"values"`
+	Next   string       `json:"next"`
+}
+
+// RepositoriesPage is one bounded page of repositories. Next is an opaque
+// reference to the following page; empty means the last page.
+type RepositoriesPage struct {
+	Values []Repository
+	Next   string
+}
+
+// ListRepositories enumerates repositories for the workspace.
+func (c *Client) ListRepositories(ctx context.Context, workspace string, limit int) ([]Repository, error) {
+	pageLen := limit
+	if pageLen <= 0 || pageLen > 100 {
+		pageLen = 20
+	}
+
+	var repos []Repository
+	next := ""
+	for {
+		page, err := c.ListRepositoriesPage(ctx, workspace, pageLen, next)
+		if err != nil {
+			return nil, err
+		}
+
+		repos = append(repos, page.Values...)
+
+		if limit > 0 && len(repos) >= limit {
+			repos = repos[:limit]
+			break
+		}
+
+		if page.Next == "" {
+			break
+		}
+		next = page.Next
+	}
+
+	return repos, nil
+}
+
+// ListRepositoriesPage fetches one repository page and preserves the opaque
+// upstream continuation reference for bounded consumers.
+func (c *Client) ListRepositoriesPage(ctx context.Context, workspace string, limit int, next string) (*RepositoriesPage, error) {
+	if workspace == "" {
+		return nil, fmt.Errorf("workspace is required")
+	}
+
+	endpoint := fmt.Sprintf("/repositories/%s", url.PathEscape(workspace))
+	path := ""
+	if next != "" {
+		normalized, err := normalizeNextRef(next, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		path = normalized
+	} else {
+		if limit <= 0 || limit > 100 {
+			limit = 20
+		}
+		path = fmt.Sprintf("%s?pagelen=%d", endpoint, limit)
+	}
+
+	req, err := c.http.NewRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var page repositoryListPage
+	if err := c.http.Do(req, &page); err != nil {
+		return nil, err
+	}
+
+	nextRef := ""
+	if page.Next != "" {
+		nextURL, err := url.Parse(page.Next)
+		if err != nil {
+			return nil, err
+		}
+		nextRef = nextURL.RequestURI()
+	}
+	return &RepositoriesPage{Values: page.Values, Next: nextRef}, nil
+}
+
+// GetRepository retrieves repository details.
+func (c *Client) GetRepository(ctx context.Context, workspace, repoSlug string) (*Repository, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+	)
+	req, err := c.http.NewRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var repo Repository
+	if err := c.http.Do(req, &repo); err != nil {
+		return nil, err
+	}
+	return &repo, nil
+}
+
+// CreateRepositoryInput describes repository creation parameters.
+type CreateRepositoryInput struct {
+	Slug        string
+	Name        string
+	Description string
+	IsPrivate   bool
+	ProjectKey  string
+}
+
+// CreateRepository creates a repository within the workspace.
+func (c *Client) CreateRepository(ctx context.Context, workspace string, input CreateRepositoryInput) (*Repository, error) {
+	if workspace == "" {
+		return nil, fmt.Errorf("workspace is required")
+	}
+	if input.Slug == "" {
+		return nil, fmt.Errorf("repository slug is required")
+	}
+
+	body := map[string]any{
+		"scm":        "git",
+		"is_private": input.IsPrivate,
+	}
+
+	if input.Name != "" {
+		body["name"] = input.Name
+	}
+	if input.Description != "" {
+		body["description"] = input.Description
+	}
+	if input.ProjectKey != "" {
+		body["project"] = map[string]any{
+			"key": input.ProjectKey,
+		}
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s",
+		url.PathEscape(workspace),
+		url.PathEscape(input.Slug),
+	)
+	req, err := c.http.NewRequest(ctx, "POST", path, body)
+	if err != nil {
+		return nil, err
+	}
+
+	var repo Repository
+	if err := c.http.Do(req, &repo); err != nil {
+		return nil, err
+	}
+	return &repo, nil
+}
+
+// TriggerPipelineInput configures a pipeline run.
+type TriggerPipelineInput struct {
+	Ref       string
+	Variables map[string]string
+}
+
+// TriggerPipeline triggers a new pipeline for the repo.
+func (c *Client) TriggerPipeline(ctx context.Context, workspace, repoSlug string, in TriggerPipelineInput) (*Pipeline, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+	if in.Ref == "" {
+		return nil, fmt.Errorf("ref is required")
+	}
+
+	body := map[string]any{
+		"target": map[string]any{
+			"ref_type": "branch",
+			"type":     "pipeline_ref_target",
+			"ref_name": in.Ref,
+		},
+	}
+	if len(in.Variables) > 0 {
+		vars := make([]map[string]any, 0, len(in.Variables))
+		for k, v := range in.Variables {
+			vars = append(vars, map[string]any{
+				"key":     k,
+				"value":   v,
+				"secured": false,
+			})
+		}
+		body["variables"] = vars
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s/pipelines/",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+	)
+
+	req, err := c.http.NewRequest(ctx, "POST", path, body)
+	if err != nil {
+		return nil, err
+	}
+
+	var pipeline Pipeline
+	if err := c.http.Do(req, &pipeline); err != nil {
+		return nil, err
+	}
+	return &pipeline, nil
+}
+
+// GetPipeline fetches pipeline details.
+func (c *Client) GetPipeline(ctx context.Context, workspace, repoSlug, uuid string) (*Pipeline, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+	pipelineUUID, err := normalizeUUIDArg("pipeline UUID", uuid)
+	if err != nil {
+		return nil, err
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s/pipelines/%s",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+		url.PathEscape(pipelineUUID),
+	)
+	req, err := c.http.NewRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var pipeline Pipeline
+	if err := c.http.Do(req, &pipeline); err != nil {
+		return nil, err
+	}
+	return &pipeline, nil
+}
+
+// GetPipelineByBuildNumber fetches a pipeline by its build number.
+func (c *Client) GetPipelineByBuildNumber(ctx context.Context, workspace, repoSlug string, buildNumber int) (*Pipeline, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+	if buildNumber <= 0 {
+		return nil, fmt.Errorf("pipeline build number must be positive")
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s/pipelines/%d",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+		buildNumber,
+	)
+	req, err := c.http.NewRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var pipeline Pipeline
+	if err := c.http.Do(req, &pipeline); err != nil {
+		return nil, err
+	}
+	return &pipeline, nil
+}
+
+// PipelineStep represents an individual pipeline step execution.
+type PipelineStep struct {
+	UUID   string         `json:"uuid"`
+	Name   string         `json:"name"`
+	State  PipelineState  `json:"state"`
+	Result PipelineResult `json:"result"` // compatibility alias; API outcome lives in state.result
+}
+
+// UnmarshalJSON decodes Bitbucket step JSON and keeps Result in sync with state.result
+// so Status() and legacy JSON consumers that read steps[].result.name keep working.
+func (s *PipelineStep) UnmarshalJSON(data []byte) error {
+	type rawStep struct {
+		UUID   string         `json:"uuid"`
+		Name   string         `json:"name"`
+		State  PipelineState  `json:"state"`
+		Result PipelineResult `json:"result"`
+	}
+	var raw rawStep
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	s.UUID = raw.UUID
+	s.Name = raw.Name
+	s.State = raw.State
+	switch {
+	case raw.State.Result.Name != "":
+		s.Result.Name = raw.State.Result.Name
+	case raw.Result.Name != "":
+		s.Result.Name = raw.Result.Name
+		s.State.Result.Name = raw.Result.Name
+	}
+	return nil
+}
+
+// MarshalJSON emits state.result and a top-level result alias for structured CLI output.
+func (s PipelineStep) MarshalJSON() ([]byte, error) {
+	type out struct {
+		UUID   string         `json:"uuid"`
+		Name   string         `json:"name"`
+		State  PipelineState  `json:"state"`
+		Result PipelineResult `json:"result"`
+	}
+	resultName := s.State.Result.Name
+	if resultName == "" {
+		resultName = s.Result.Name
+	}
+	return json.Marshal(out{
+		UUID:   s.UUID,
+		Name:   s.Name,
+		State:  s.State,
+		Result: PipelineResult{Name: resultName},
+	})
+}
+
+// Status returns the step state and result as a single string.
+// When the step is completed the result is appended (e.g. "COMPLETED SUCCESSFUL"),
+// otherwise only the state is returned (e.g. "PENDING").
+func (s PipelineStep) Status() string {
+	result := s.State.Result.Name
+	if result == "" {
+		result = s.Result.Name
+	}
+	if result != "" {
+		return s.State.Name + " " + result
+	}
+	return s.State.Name
+}
+
+// ListPipelineSteps enumerates step executions for the pipeline.
+func (c *Client) ListPipelineSteps(ctx context.Context, workspace, repoSlug, pipelineUUID string) ([]PipelineStep, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+	normalizedPipelineUUID, err := normalizeUUIDArg("pipeline UUID", pipelineUUID)
+	if err != nil {
+		return nil, err
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s/pipelines/%s/steps/?pagelen=100",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+		url.PathEscape(normalizedPipelineUUID),
+	)
+
+	var steps []PipelineStep
+	for path != "" {
+		req, err := c.http.NewRequest(ctx, "GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var resp struct {
+			Values []PipelineStep `json:"values"`
+			Next   string         `json:"next"`
+		}
+		if err := c.http.Do(req, &resp); err != nil {
+			return nil, err
+		}
+
+		steps = append(steps, resp.Values...)
+
+		if resp.Next == "" {
+			break
+		}
+		nextURL, err := url.Parse(resp.Next)
+		if err != nil {
+			return nil, fmt.Errorf("parse pipeline steps next URL %q: %w", resp.Next, err)
+		}
+		if nextURL.IsAbs() {
+			if uri := nextURL.RequestURI(); uri != "" {
+				path = uri
+			} else {
+				path = nextURL.String()
+			}
+		} else {
+			path = nextURL.String()
+		}
+	}
+
+	return steps, nil
+}
+
+// PipelineLog represents a step log chunk.
+type PipelineLog struct {
+	StepUUID string `json:"step_uuid"`
+	Type     string `json:"type"`
+	Log      string `json:"log"`
+}
+
+// CommitStatus describes build status for a commit.
+// Type alias to shared types.CommitStatus for backward compatibility.
+type CommitStatus = types.CommitStatus
+
+// GetPipelineLogs fetches logs for a pipeline step.
+func (c *Client) GetPipelineLogs(ctx context.Context, workspace, repoSlug, pipelineUUID, stepUUID string) ([]byte, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+	normalizedPipelineUUID, err := normalizeUUIDArg("pipeline UUID", pipelineUUID)
+	if err != nil {
+		return nil, err
+	}
+	normalizedStepUUID, err := normalizeUUIDArg("step UUID", stepUUID)
+	if err != nil {
+		return nil, err
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s/pipelines/%s/steps/%s/log",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+		url.PathEscape(normalizedPipelineUUID),
+		url.PathEscape(normalizedStepUUID),
+	)
+
+	req, err := c.http.NewRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Override Accept header - logs endpoint returns octet-stream, not JSON
+	req.Header.Set("Accept", "application/octet-stream")
+
+	var buf strings.Builder
+	if err := c.http.Do(req, &buf); err != nil {
+		return nil, err
+	}
+
+	return []byte(buf.String()), nil
+}
+
+// CommitStatuses returns build statuses for a commit.
+func (c *Client) CommitStatuses(ctx context.Context, workspace, repoSlug, commit string) ([]CommitStatus, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+	if commit == "" {
+		return nil, fmt.Errorf("commit SHA is required")
+	}
+
+	path := fmt.Sprintf("/repositories/%s/%s/commit/%s/statuses",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+		url.PathEscape(commit),
+	)
+
+	var statuses []CommitStatus
+	for path != "" {
+		req, err := c.http.NewRequest(ctx, "GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var resp struct {
+			Values []CommitStatus `json:"values"`
+			Next   string         `json:"next"`
+		}
+		if err := c.http.Do(req, &resp); err != nil {
+			return nil, err
+		}
+
+		statuses = append(statuses, resp.Values...)
+
+		if resp.Next == "" {
+			break
+		}
+		nextURL, err := url.Parse(resp.Next)
+		if err != nil {
+			return nil, err
+		}
+		path = nextURL.RequestURI()
+	}
+
+	return statuses, nil
+}
+
+// CommitStatusesPage is one bounded Cloud commit-status page. Next is an
+// opaque continuation reference; callers must pass it back to this method.
+type CommitStatusesPage struct {
+	Values []CommitStatus
+	Next   string
+}
+
+// CommitStatusesPage fetches one commit-status page without flattening the
+// rest of the sequence.
+func (c *Client) CommitStatusesPage(ctx context.Context, workspace, repoSlug, commit string, limit int, next string) (*CommitStatusesPage, error) {
+	if workspace == "" || repoSlug == "" {
+		return nil, fmt.Errorf("workspace and repository slug are required")
+	}
+	if commit == "" {
+		return nil, fmt.Errorf("commit SHA is required")
+	}
+
+	endpoint := fmt.Sprintf("/repositories/%s/%s/commit/%s/statuses",
+		url.PathEscape(workspace),
+		url.PathEscape(repoSlug),
+		url.PathEscape(commit),
+	)
+	path := endpoint
+	if next != "" {
+		normalized, err := normalizeNextRef(next, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		path = normalized
+	} else {
+		if limit <= 0 || limit > 100 {
+			limit = 100
+		}
+		path += fmt.Sprintf("?pagelen=%d", limit)
+	}
+
+	req, err := c.http.NewRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var page struct {
+		Values []CommitStatus `json:"values"`
+		Next   string         `json:"next"`
+	}
+	if err := c.http.Do(req, &page); err != nil {
+		return nil, err
+	}
+	normalizedNext := ""
+	if page.Next != "" {
+		normalizedNext, err = normalizeNextRef(page.Next, endpoint)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &CommitStatusesPage{Values: page.Values, Next: normalizedNext}, nil
+}
+
+// WorkspacePullRequestsOptions configures workspace-level PR listings.
+type WorkspacePullRequestsOptions struct {
+	State string
+	Limit int
+}
+
+// ListWorkspacePullRequestsPage fetches a single page of pull requests
+// authored by the specified user across the workspace. Pass next="" for the
+// first page or a Next value from a previous page. This endpoint is
+// author-scoped only: the Cloud API has no workspace-wide reviewer filter.
+func (c *Client) ListWorkspacePullRequestsPage(ctx context.Context, workspace, username string, opts WorkspacePullRequestsOptions, next string) (*PullRequestsPage, error) {
+	if workspace == "" {
+		return nil, fmt.Errorf("workspace is required")
+	}
+	if username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+
+	if next != "" {
+		endpoint := fmt.Sprintf("/workspaces/%s/pullrequests/%s",
+			url.PathEscape(workspace), url.PathEscape(username))
+		normalized, err := normalizeNextRef(next, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		return c.fetchPullRequestsPage(ctx, normalized)
+	}
+
+	pageLen := opts.Limit
+	if pageLen <= 0 || pageLen > 100 {
+		pageLen = 20
+	}
+
+	var params []string
+	params = append(params, fmt.Sprintf("pagelen=%d", pageLen))
+	params = append(params, pullRequestStateParams(opts.State)...)
+
+	path := fmt.Sprintf("/workspaces/%s/pullrequests/%s?%s",
+		url.PathEscape(workspace),
+		url.PathEscape(username),
+		strings.Join(params, "&"),
+	)
+
+	return c.fetchPullRequestsPage(ctx, path)
+}
+
+// ListWorkspacePullRequests lists pull requests authored by the specified user across all repositories in the workspace.
+func (c *Client) ListWorkspacePullRequests(ctx context.Context, workspace, username string, opts WorkspacePullRequestsOptions) ([]PullRequest, error) {
+	var prs []PullRequest
+	next := ""
+	for {
+		page, err := c.ListWorkspacePullRequestsPage(ctx, workspace, username, opts, next)
+		if err != nil {
+			return nil, err
+		}
+
+		prs = append(prs, page.Values...)
+
+		if opts.Limit > 0 && len(prs) >= opts.Limit {
+			prs = prs[:opts.Limit]
+			break
+		}
+
+		if page.Next == "" {
+			break
+		}
+		next = page.Next
+	}
+
+	return prs, nil
+}
