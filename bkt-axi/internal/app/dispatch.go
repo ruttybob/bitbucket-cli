@@ -53,6 +53,17 @@ func (p ParsedFlags) Bool(name string) bool {
 // Changed reports whether name was explicitly set on the command line.
 func (p ParsedFlags) Changed(name string) bool { return p.set[name] }
 
+// StringSlice returns the accumulated []string for a FlagStringSlice flag. The
+// slice is non-nil only when the flag was declared as a slice; otherwise nil.
+func (p ParsedFlags) StringSlice(name string) []string {
+	if v, ok := p.vals[name]; ok {
+		if s, ok := v.([]string); ok {
+			return s
+		}
+	}
+	return nil
+}
+
 // errUnknownFlag carries the offending flag name so the dispatcher can build a
 // self-correcting usage error with the command's valid-flag list.
 type errUnknownFlag struct{ name string }
@@ -80,7 +91,7 @@ func parseFlags(args []string, fs FlagSet) (ParsedFlags, []string, error) {
 	}
 	// seed declared defaults
 	for _, f := range fs {
-		parsed.vals[f.Name] = f.Default
+		parsed.vals[f.Name] = seedDefault(f)
 	}
 	for name, ft := range globalFlags {
 		switch ft {
@@ -100,6 +111,19 @@ func parseFlags(args []string, fs FlagSet) (ParsedFlags, []string, error) {
 			positionals = append(positionals, args[i:]...)
 			break
 		}
+		// Short flag: a single leading dash followed by a non-dash char that
+		// matches a declared Short. -F, -Fvalue, and -F value are all accepted.
+		if isShortFlag(tok) {
+			if name, inline, hasInline, ok, err := resolveShort(tok, fs); ok {
+				if err != nil {
+					return parsed, nil, err
+				}
+				if perr := parsed.consume(fs, name, inline, args, &i, withInline(hasInline)); perr != nil {
+					return parsed, nil, perr
+				}
+				continue
+			}
+		}
 		if !strings.HasPrefix(tok, "--") || tok == "--" {
 			positionals = append(positionals, tok)
 			continue
@@ -116,44 +140,139 @@ func parseFlags(args []string, fs FlagSet) (ParsedFlags, []string, error) {
 		}
 		name = strings.ToLower(name)
 
-		ft, known := flagType(name, fs)
-		if !known {
-			return parsed, nil, &errUnknownFlag{name: name}
-		}
-
-		switch ft {
-		case FlagBool:
-			val := true
-			if hasInline {
-				b, err := strconv.ParseBool(inline)
-				if err != nil {
-					return parsed, nil, &errBadValue{name: name, raw: inline}
-				}
-				val = b
-			}
-			parsed.vals[name] = val
-			parsed.set[name] = true
-		case FlagInt:
-			raw, ok := takeValue(args, &i, inline, hasInline)
-			if !ok {
-				return parsed, nil, &errFlagNeedsArg{name: name}
-			}
-			n, err := strconv.Atoi(raw)
-			if err != nil {
-				return parsed, nil, &errBadValue{name: name, raw: raw}
-			}
-			parsed.vals[name] = n
-			parsed.set[name] = true
-		default: // FlagString
-			raw, ok := takeValue(args, &i, inline, hasInline)
-			if !ok {
-				return parsed, nil, &errFlagNeedsArg{name: name}
-			}
-			parsed.vals[name] = raw
-			parsed.set[name] = true
+		if perr := parsed.consume(fs, name, inlineIf(hasInline, inline), args, &i, withInline(hasInline)); perr != nil {
+			return parsed, nil, perr
 		}
 	}
 	return parsed, positionals, nil
+}
+
+// seedDefault returns the zero value for a flag's type, used when no Default is
+// declared. Slice flags seed to an empty (non-nil) slice so accessors are safe.
+func seedDefault(f Flag) any {
+	switch f.Type {
+	case FlagStringSlice:
+		if d, ok := f.Default.([]string); ok {
+			return append([]string(nil), d...)
+		}
+		return []string{}
+	case FlagBool:
+		if f.Default != nil {
+			return f.Default
+		}
+		return false
+	default:
+		if f.Default != nil {
+			return f.Default
+		}
+		return ""
+	}
+}
+
+// isShortFlag reports whether tok looks like a short flag: "-", then a letter,
+// and not "--". Negative numbers ("-3") are excluded because the second char is
+// not a letter.
+func isShortFlag(tok string) bool {
+	if len(tok) < 2 || tok[0] != '-' || tok[1] == '-' {
+		return false
+	}
+	c := tok[1]
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// resolveShort maps a -X[/value] token to its declared long name when a Flag
+// with that Short exists. Returns ok=false when no short matches (the token is
+// then treated as a positional). hasInline reports whether a value was attached
+// to the token (-Fvalue / -F=value); an inline value attached to a bool short
+// is a usage error.
+func resolveShort(tok string, fs FlagSet) (name, inline string, hasInline, ok bool, err error) {
+	body := tok[1:]
+	short := string(body[0])
+	for _, f := range fs {
+		if f.Short == short {
+			name = f.Name
+			if len(body) > 1 {
+				rest := body[1:]
+				if rest[0] == '=' {
+					rest = rest[1:]
+				}
+				if f.Type == FlagBool {
+					return "", "", false, false, &errBadValue{name: name, raw: tok}
+				}
+				inline = rest
+				hasInline = true
+			}
+			return name, inline, hasInline, true, nil
+		}
+	}
+	return "", "", false, false, nil
+}
+
+// consume applies one flag occurrence (already name-resolved) to parsed. It
+// handles type coercion, inline vs. next-arg value, and slice accumulation.
+func (p ParsedFlags) consume(fs FlagSet, name, inline string, args []string, i *int, opts ...consumeOpt) error {
+	ft, known := flagType(name, fs)
+	if !known {
+		return &errUnknownFlag{name: name}
+	}
+	hasInline := false
+	for _, o := range opts {
+		if o.inlineSet {
+			hasInline = true
+		}
+	}
+
+	switch ft {
+	case FlagBool:
+		val := true
+		if hasInline {
+			b, err := strconv.ParseBool(inline)
+			if err != nil {
+				return &errBadValue{name: name, raw: inline}
+			}
+			val = b
+		}
+		p.vals[name] = val
+		p.set[name] = true
+	case FlagInt:
+		raw, ok := takeValue(args, i, inline, hasInline)
+		if !ok {
+			return &errFlagNeedsArg{name: name}
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return &errBadValue{name: name, raw: raw}
+		}
+		p.vals[name] = n
+		p.set[name] = true
+	case FlagStringSlice:
+		raw, ok := takeValue(args, i, inline, hasInline)
+		if !ok {
+			return &errFlagNeedsArg{name: name}
+		}
+		cur, _ := p.vals[name].([]string)
+		p.vals[name] = append(cur, raw)
+		p.set[name] = true
+	default: // FlagString
+		raw, ok := takeValue(args, i, inline, hasInline)
+		if !ok {
+			return &errFlagNeedsArg{name: name}
+		}
+		p.vals[name] = raw
+		p.set[name] = true
+	}
+	return nil
+}
+
+// consumeOpt tunes consume; only the inline marker is used today.
+type consumeOpt struct{ inlineSet bool }
+
+func withInline(b bool) consumeOpt { return consumeOpt{inlineSet: b} }
+func inlineIf(b bool, s string) string {
+	if b {
+		return s
+	}
+	return ""
 }
 
 // flagType reports the declared type of name across the command's set and the
@@ -245,30 +364,40 @@ func (a *App) dispatch(argv []string) error {
 		return unknownCommandErr(argv[0], a.nounNames())
 	}
 
-	if len(argv) == 1 {
-		return a.printNounHelp(noun)
+	// Walk the command tree to arbitrary depth: descend through named children
+	// (noun → noun → verb) until a leaf command (Run != nil) is reached, then
+	// parse the remaining tokens as its flags and positionals. This supports
+	// both shallow commands (`pr list`, `api <path>`) and grouped nouns
+	// (`pr reviewer list <id>`, `perms project grant <key> <user> <perm>`).
+	cmd := noun
+	rest := argv[1:]
+	for cmd.Run == nil {
+		if len(rest) == 0 {
+			return a.printNounHelp(cmd)
+		}
+		child := cmd.findChild(rest[0])
+		if child == nil {
+			return unknownCommandErr(rest[0], cmd.childNames())
+		}
+		cmd = child
+		rest = rest[1:]
 	}
 
-	verb := noun.findChild(argv[1])
-	if verb == nil {
-		return unknownCommandErr(argv[1], noun.childNames())
-	}
-
-	parsed, positionals, err := parseFlags(argv[2:], verb.Flags)
+	parsed, positionals, err := parseFlags(rest, cmd.Flags)
 	if err != nil {
-		return flagParseError(verb, err)
+		return flagParseError(cmd, err)
 	}
 
 	if parsed.Bool("help") {
-		return a.printCommandHelp(verb)
+		return a.printCommandHelp(cmd)
 	}
 
-	if err := validateArgs(verb, positionals); err != nil {
+	if err := validateArgs(cmd, positionals); err != nil {
 		return err
 	}
 
-	ctx := &Context{App: a, Cmd: verb, Args: positionals, Flags: parsed}
-	return verb.Run(ctx)
+	ctx := &Context{App: a, Cmd: cmd, Args: positionals, Flags: parsed}
+	return cmd.Run(ctx)
 }
 
 // flagParseError converts a parser error into a self-correcting usage error.
@@ -313,13 +442,20 @@ func leafName(path string) string {
 	return path
 }
 
-// wireParents sets each child's parent pointer so path() renders correctly.
+// wireParents sets each command's parent pointer so path() renders correctly,
+// recursing through the whole tree so grouped nouns (`pr reviewer list`) build
+// their full path.
 func (a *App) wireParents() {
 	for _, n := range a.Commands {
-		n.parent = &Command{Name: ""} // noun's parent is the (nameless) root
-		for _, v := range n.Children {
-			v.parent = n
-		}
+		wireTree(n, &Command{Name: ""}) // noun's parent is the (nameless) root
+	}
+}
+
+// wireTree sets cmd's parent and recurses into its children.
+func wireTree(cmd, parent *Command) {
+	cmd.parent = parent
+	for _, c := range cmd.Children {
+		wireTree(c, cmd)
 	}
 }
 

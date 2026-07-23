@@ -37,8 +37,382 @@ func NewPRCmd() *app.Command {
 		Children: append([]*app.Command{
 			newPRListCmd(),
 			newPRViewCmd(),
+			newPRReviewerCmd(),
+			newPRTaskCmd(),
+			newPRSuggestionsCmd(),
+			newPRChecksCmd(),
 		}, newPRMutationChildren()...),
 	}
+}
+
+// --- pr reviewer --------------------------------------------------------
+
+func newPRReviewerCmd() *app.Command {
+	return &app.Command{
+		Name:  "reviewer",
+		Short: "Manage pull request reviewers",
+		Long:  "List, add, and remove reviewers on a pull request. Add/remove are idempotent.",
+		Children: []*app.Command{
+			{Name: "list", Aliases: []string{"ls"}, Short: "List reviewers",
+				Flags: selectorFlags(), MinArgs: 1, MaxArgs: 1, Run: runPRReviewerList},
+			{Name: "add", Short: "Add a reviewer",
+				Flags: selectorFlags(), MinArgs: 2, MaxArgs: 2, Run: runPRReviewerAdd},
+			{Name: "remove", Aliases: []string{"rm"}, Short: "Remove a reviewer",
+				Flags: selectorFlags(), MinArgs: 2, MaxArgs: 2, Run: runPRReviewerRemove},
+		},
+	}
+}
+
+var reviewerSchema = []axi.Field{
+	{Key: "name", Extractor: axi.Pluck("name")},
+	{Key: "state", Extractor: axi.Pluck("state")},
+	{Key: "approved", Extractor: axi.BoolYesNo(axi.Pluck("approved"))},
+}
+
+func runPRReviewerList(ctx *app.Context) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if scope.Empty() {
+		return axi.Errorf("no repository resolved; use --repo (and --workspace or --project) or set a context")
+	}
+	id, idErr := parseID(ctx.Args[0])
+	if idErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid pull request id %q: %s", ctx.Args[0], idErr))
+	}
+	reviewers, err := client.ListPRReviewers(context.Background(), scope, id)
+	if err != nil {
+		return err
+	}
+	if len(reviewers) == 0 {
+		emitEmpty(ctx, "reviewers", fmt.Sprintf("0 reviewers on pull request #%d", id), []string{
+			fmt.Sprintf("Run `bkt-axi pr reviewer add %d <user>` to request a review", id),
+		})
+		return nil
+	}
+	emitList(ctx, "reviewers", toAny(reviewers), reviewerSchema, len(reviewers), nil)
+	return nil
+}
+
+func runPRReviewerAdd(ctx *app.Context) error {
+	return runPRReviewerMutate(ctx, "add")
+}
+
+func runPRReviewerRemove(ctx *app.Context) error {
+	return runPRReviewerMutate(ctx, "remove")
+}
+
+func runPRReviewerMutate(ctx *app.Context, verb string) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if scope.Empty() {
+		return axi.Errorf("no repository resolved; use --repo (and --workspace or --project) or set a context")
+	}
+	id, idErr := parseID(ctx.Args[0])
+	if idErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid pull request id %q: %s", ctx.Args[0], idErr))
+	}
+	user := ctx.Args[1]
+	var (
+		changed bool
+		merr    error
+	)
+	if verb == "add" {
+		changed, merr = client.AddPRReviewer(context.Background(), scope, id, user)
+	} else {
+		changed, merr = client.RemovePRReviewer(context.Background(), scope, id, user)
+	}
+	if merr != nil {
+		return merr
+	}
+	if !changed {
+		emitConfirmation(ctx, fmt.Sprintf("%s is already %s pull request #%d (no-op)", user, reviewerStatusWord(verb), id))
+		return nil
+	}
+	emitConfirmation(ctx, fmt.Sprintf("%s %s on pull request #%d", verb, user, id))
+	return nil
+}
+
+func reviewerStatusWord(verb string) string {
+	if verb == "add" {
+		return "a reviewer on"
+	}
+	return "absent from"
+}
+
+// --- pr task (DC) -------------------------------------------------------
+
+func newPRTaskCmd() *app.Command {
+	return &app.Command{
+		Name:  "task",
+		Short: "Manage pull request tasks (Data Center)",
+		Long:  "List, create, complete, and reopen tasks on a pull request (Data Center). Complete/reopen are idempotent.",
+		Children: []*app.Command{
+			{Name: "list", Aliases: []string{"ls"}, Short: "List tasks",
+				Flags: selectorFlags(), MinArgs: 1, MaxArgs: 1, Run: runPRTaskList},
+			{Name: "create", Short: "Create a task",
+				Flags: selectorFlags(), MinArgs: 2, MaxArgs: 2, Run: runPRTaskCreate},
+			{Name: "complete", Short: "Complete (resolve) a task",
+				Flags: selectorFlags(), MinArgs: 2, MaxArgs: 2, Run: runPRTaskComplete},
+			{Name: "reopen", Short: "Reopen a task",
+				Flags: selectorFlags(), MinArgs: 2, MaxArgs: 2, Run: runPRTaskReopen},
+		},
+	}
+}
+
+var taskSchema = []axi.Field{
+	{Key: "id", Extractor: axi.Pluck("id")},
+	{Key: "state", Extractor: axi.Pluck("state")},
+	{Key: "text", Extractor: axi.Pluck("text")},
+	{Key: "author", Extractor: axi.Pluck("author")},
+}
+
+func runPRTaskList(ctx *app.Context) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if scope.Empty() {
+		return axi.Errorf("no repository resolved; use --repo (and --project) or set a context")
+	}
+	id, idErr := parseID(ctx.Args[0])
+	if idErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid pull request id %q: %s", ctx.Args[0], idErr))
+	}
+	tasks, err := client.ListPRTasks(context.Background(), scope, id)
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		emitEmpty(ctx, "tasks", fmt.Sprintf("0 tasks on pull request #%d", id), []string{
+			fmt.Sprintf("Run `bkt-axi pr task create %d \"<text>\"` to add a task", id),
+		})
+		return nil
+	}
+	emitList(ctx, "tasks", toAny(tasks), taskSchema, len(tasks), nil)
+	return nil
+}
+
+func runPRTaskCreate(ctx *app.Context) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if scope.Empty() {
+		return axi.Errorf("no repository resolved; use --repo (and --project) or set a context")
+	}
+	id, idErr := parseID(ctx.Args[0])
+	if idErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid pull request id %q: %s", ctx.Args[0], idErr))
+	}
+	task, err := client.CreatePRTask(context.Background(), scope, id, ctx.Args[1])
+	if err != nil {
+		return err
+	}
+	emitDetail(ctx, "task", *task, taskSchema, nil)
+	return nil
+}
+
+func runPRTaskComplete(ctx *app.Context) error {
+	return runPRTaskState(ctx, true)
+}
+
+func runPRTaskReopen(ctx *app.Context) error {
+	return runPRTaskState(ctx, false)
+}
+
+func runPRTaskState(ctx *app.Context, resolve bool) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if scope.Empty() {
+		return axi.Errorf("no repository resolved; use --repo (and --project) or set a context")
+	}
+	id, idErr := parseID(ctx.Args[0])
+	if idErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid pull request id %q: %s", ctx.Args[0], idErr))
+	}
+	taskID, tErr := parseID(ctx.Args[1])
+	if tErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid task id %q: %s", ctx.Args[1], tErr))
+	}
+	var (
+		task    *bitbucket.PullRequestTask
+		changed bool
+	)
+	if resolve {
+		task, changed, err = client.CompletePRTask(context.Background(), scope, id, taskID)
+	} else {
+		task, changed, err = client.ReopenPRTask(context.Background(), scope, id, taskID)
+	}
+	if err != nil {
+		return err
+	}
+	verb := "completed"
+	target := "resolved"
+	if !resolve {
+		verb = "reopened"
+		target = "open"
+	}
+	if !changed {
+		emitConfirmation(ctx, fmt.Sprintf("task #%d already %s (no-op)", taskID, target))
+		return nil
+	}
+	emitDetail(ctx, "task", *task, taskSchema, nil)
+	_ = verb
+	return nil
+}
+
+// --- pr suggestions (DC) ------------------------------------------------
+
+func newPRSuggestionsCmd() *app.Command {
+	return &app.Command{
+		Name:  "suggestions",
+		Short: "Manage code suggestions (Data Center)",
+		Long:  "List and apply inline code suggestions on a pull request (Data Center). Apply is idempotent.",
+		Children: []*app.Command{
+			{Name: "list", Aliases: []string{"ls"}, Short: "List suggestions",
+				Flags: selectorFlags(), MinArgs: 1, MaxArgs: 1, Run: runPRSuggestionsList},
+			{Name: "apply", Short: "Apply a suggestion",
+				Flags: selectorFlags(), MinArgs: 3, MaxArgs: 3, Run: runPRSuggestionsApply},
+		},
+	}
+}
+
+var suggestionSchema = []axi.Field{
+	{Key: "id", Extractor: axi.Pluck("id")},
+	{Key: "comment_id", Extractor: axi.Pluck("comment_id")},
+	{Key: "applied", Extractor: axi.BoolYesNo(axi.Pluck("applied"))},
+	{Key: "text", Extractor: axi.Pluck("text")},
+}
+
+func runPRSuggestionsList(ctx *app.Context) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if scope.Empty() {
+		return axi.Errorf("no repository resolved; use --repo (and --project) or set a context")
+	}
+	id, idErr := parseID(ctx.Args[0])
+	if idErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid pull request id %q: %s", ctx.Args[0], idErr))
+	}
+	sugs, err := client.ListPRSuggestions(context.Background(), scope, id)
+	if err != nil {
+		return err
+	}
+	if len(sugs) == 0 {
+		emitEmpty(ctx, "suggestions", fmt.Sprintf("0 suggestions on pull request #%d", id), nil)
+		return nil
+	}
+	emitList(ctx, "suggestions", toAny(sugs), suggestionSchema, len(sugs), nil)
+	return nil
+}
+
+func runPRSuggestionsApply(ctx *app.Context) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if scope.Empty() {
+		return axi.Errorf("no repository resolved; use --repo (and --project) or set a context")
+	}
+	prID, pErr := parseID(ctx.Args[0])
+	if pErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid pull request id %q: %s", ctx.Args[0], pErr))
+	}
+	commentID, cErr := parseID(ctx.Args[1])
+	if cErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid comment id %q: %s", ctx.Args[1], cErr))
+	}
+	suggestionID, sErr := parseID(ctx.Args[2])
+	if sErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid suggestion id %q: %s", ctx.Args[2], sErr))
+	}
+	changed, err := client.ApplyPRSuggestion(context.Background(), scope, prID, commentID, suggestionID)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		emitConfirmation(ctx, fmt.Sprintf("suggestion #%d already applied (no-op)", suggestionID))
+		return nil
+	}
+	emitConfirmation(ctx, fmt.Sprintf("applied suggestion #%d on pull request #%d", suggestionID, prID))
+	return nil
+}
+
+// --- pr checks (cross-platform) ----------------------------------------
+
+func newPRChecksCmd() *app.Command {
+	return &app.Command{
+		Name:    "checks",
+		Short:   "Show CI/build status for a pull request",
+		Long:    "Show build/CI statuses for a pull request's head commit (Data Center build-status or Cloud commit-status).",
+		Flags:   selectorFlags(),
+		MinArgs: 1, MaxArgs: 1,
+		Examples: []app.Example{{Cmd: "bkt-axi pr checks 42", What: "statuses for PR #42's head commit"}},
+		Run:      runPRChecks,
+	}
+}
+
+func runPRChecks(ctx *app.Context) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if scope.Empty() {
+		return axi.Errorf("no repository resolved; use --repo (and --workspace or --project) or set a context")
+	}
+	id, idErr := parseID(ctx.Args[0])
+	if idErr != nil {
+		return axi.UsageError(fmt.Sprintf("invalid pull request id %q: %s", ctx.Args[0], idErr))
+	}
+	statuses, err := client.PRChecks(context.Background(), scope, id)
+	if err != nil {
+		return err
+	}
+	items := make([]any, len(statuses))
+	for i := range statuses {
+		items[i] = statuses[i]
+	}
+	return emitStatuses(ctx, items, fmt.Sprintf("pull request #%d", id))
 }
 
 func newPRListCmd() *app.Command {

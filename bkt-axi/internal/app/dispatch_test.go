@@ -180,3 +180,87 @@ func TestExitCodeMapping(t *testing.T) {
 		t.Fatal("no-op must map to 0")
 	}
 }
+
+// --- Phase 3 dispatcher features: short flags, string slices, nested/leaf dispatch ---
+
+func buildNestedApp() *App {
+	// pr reviewer list <id>: three-level nesting (noun → noun → verb).
+	reviewerList := &Command{
+		Name: "list", Short: "List reviewers", MinArgs: 1, MaxArgs: 1,
+		Run: func(ctx *Context) error {
+			ctx.Print("reviewers for " + ctx.Args[0])
+			return nil
+		},
+	}
+	reviewer := &Command{Name: "reviewer", Short: "Reviewers", Children: []*Command{reviewerList}}
+	pr := &Command{Name: "pr", Short: "prs", Children: []*Command{reviewer}}
+	// leaf noun with a repeatable short-flag field.
+	apiRun := func(ctx *Context) error {
+		ctx.Print("fields=" + strings.Join(ctx.Flags.StringSlice("field"), ",") + " method=" + ctx.Flags.String("method"))
+		return nil
+	}
+	api := &Command{
+		Name: "api", Short: "raw", MinArgs: 1, MaxArgs: 1, Run: apiRun,
+		Flags: FlagSet{
+			{Name: "method", Type: FlagString, Default: "GET", Desc: "method"},
+			{Name: "field", Short: "F", Type: FlagStringSlice, Default: []string{}, Desc: "repeatable"},
+		},
+	}
+	return &App{Name: "bkt-axi", Description: "test", Commands: []*Command{pr, api}}
+}
+
+func TestDispatch_NestedNounThreeLevels(t *testing.T) {
+	a := buildNestedApp()
+	var out bytes.Buffer
+	a.Stdout = &out
+	code := a.Run([]string{"pr", "reviewer", "list", "42"})
+	if code != ExitSuccess {
+		t.Fatalf("nested dispatch exit %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "reviewers for 42") {
+		t.Fatalf("nested verb did not run: %q", out.String())
+	}
+}
+
+func TestDispatch_LeafNounWithShortFlagAndSlice(t *testing.T) {
+	a := buildNestedApp()
+	var out bytes.Buffer
+	a.Stdout = &out
+	code := a.Run([]string{"api", "/user", "-F", "a=1", "--field", "b=2", "-Fc=3"})
+	if code != ExitSuccess {
+		t.Fatalf("leaf dispatch exit %d: %s", code, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "fields=a=1,b=2,c=3") {
+		t.Fatalf("slice + short flag not accumulated: %q", got)
+	}
+	if !strings.Contains(got, "method=GET") {
+		t.Fatalf("default method wrong: %q", got)
+	}
+}
+
+func TestDispatch_LeafNounHelp(t *testing.T) {
+	a := buildNestedApp()
+	var out bytes.Buffer
+	a.Stdout = &out
+	code := a.Run([]string{"api", "--help"})
+	if code != ExitSuccess {
+		t.Fatalf("--help exit %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "command: api") || !strings.Contains(out.String(), "--field, -F") {
+		t.Fatalf("leaf --help wrong:\n%s", out.String())
+	}
+}
+
+func TestDispatch_NestedUnknownVerbClearHint(t *testing.T) {
+	a := buildNestedApp()
+	var out bytes.Buffer
+	a.Stdout = &out
+	code := a.Run([]string{"pr", "reviewer", "bogus"})
+	if code != ExitUsage {
+		t.Fatalf("unknown nested verb should exit 2, got %d", code)
+	}
+	if !strings.Contains(out.String(), "unknown command `bogus`") || !strings.Contains(out.String(), "available commands: list") {
+		t.Fatalf("missing nested hint:\n%s", out.String())
+	}
+}

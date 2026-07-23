@@ -24,3 +24,13 @@ func asHTTPError(err error, target **httpx.HTTPError) bool {
 func axiMap(he *httpx.HTTPError, noun string) error {
 	return axi.MapHTTPError(he.StatusCode, he.Error(), noun, false)
 }
+
+// isNotFound reports whether err wraps a 404 transport error. Idempotent
+// delete/destroy commands use it to treat an already-gone resource as a no-op.
+func isNotFound(err error) bool {
+	var he *httpx.HTTPError
+	if asHTTPError(err, &he) {
+		return he.StatusCode == 404
+	}
+	return false
+}

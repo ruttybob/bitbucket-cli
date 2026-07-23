@@ -26,6 +26,15 @@ func NewApp(binPath string) *app.App {
 			NewBranchCmd(),
 			NewCommitCmd(),
 			NewPipelineCmd(),
+			NewIssueCmd(),
+			NewWebhookCmd(),
+			NewVariableCmd(),
+			NewProjectCmd(),
+			NewStatusCmd(),
+			NewPermsCmd(),
+			NewAdminCmd(),
+			NewAPICmd(),
+			NewContextCmd(),
 		},
 	}
 	a.Home = RunHome

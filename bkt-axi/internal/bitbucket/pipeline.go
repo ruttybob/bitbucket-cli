@@ -12,14 +12,7 @@ import (
 // pipeline.go adapts the salvaged Cloud client into the normalized Pipeline
 // model. Pipelines are a Bitbucket Cloud concept; Data Center has no
 // equivalent, so every method here returns a clear Cloud-only error when the
-// active host is Data Center (see CloudOnly in this file).
-
-// CloudOnly returns a structured, agent-readable error explaining that a
-// Cloud-only command cannot run against the active host. otherName is the
-// human label of the unsupported host (e.g. "Bitbucket Data Center").
-func CloudOnly(feature, otherName string) error {
-	return fmt.Errorf("%s is Bitbucket Cloud only; the active host is %s", feature, otherName)
-}
+// active host is Data Center (see CloudOnly in guards.go).
 
 // hostKindLabel renders the active host's kind as a human product name.
 func (c *Client) hostKindLabel() string {

@@ -42,7 +42,9 @@ func (a *App) displayBin() string {
 	return collapseHome(a.BinPath)
 }
 
-// printNounHelp renders the subcommand list for a noun (e.g. `pr` with no verb).
+// printNounHelp renders the subcommand list for a noun (e.g. `pr` with no verb,
+// or a grouped noun like `pr reviewer`). It uses the full command path so
+// nested nouns identify themselves ("issue attachment", not just "attachment").
 func (a *App) printNounHelp(noun *Command) error {
 	rows := make([]axi.Object, 0, len(noun.Children))
 	for _, v := range noun.Children {
@@ -52,11 +54,11 @@ func (a *App) printNounHelp(noun *Command) error {
 		))
 	}
 	doc := axi.NewObject(
-		axi.KV{Key: "command", Value: noun.Name},
+		axi.KV{Key: "command", Value: noun.path()},
 		axi.KV{Key: "description", Value: noun.Long},
 		axi.KV{Key: "subcommands", Value: rows},
 		axi.KV{Key: "help", Value: axi.HelpRows([]string{
-			"Run `bkt-axi " + noun.Name + " <subcommand> --help` for details",
+			"Run `bkt-axi " + noun.path() + " <subcommand> --help` for details",
 		})},
 	)
 	a.Println(axi.Marshal(doc))
@@ -75,7 +77,7 @@ func (a *App) printCommandHelp(cmd *Command) error {
 		flagRows := make([]axi.Object, 0, len(cmd.Flags))
 		for _, f := range cmd.Flags {
 			flagRows = append(flagRows, axi.NewObject(
-				axi.KV{Key: "flag", Value: "--" + f.Name},
+				axi.KV{Key: "flag", Value: flagLabel(f)},
 				axi.KV{Key: "description", Value: f.Desc},
 				axi.KV{Key: "default", Value: flagDefaultDisplay(f.Default)},
 			))
@@ -127,6 +129,14 @@ func flagDefaultDisplay(v any) string {
 		return "false"
 	}
 	return strings.TrimSpace(formatAny(v))
+}
+
+// flagLabel renders a flag's display name with its short alias when declared.
+func flagLabel(f Flag) string {
+	if f.Short != "" {
+		return "--" + f.Name + ", -" + f.Short
+	}
+	return "--" + f.Name
 }
 
 func firstNonEmpty(values ...string) string {
