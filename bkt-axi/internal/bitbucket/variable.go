@@ -44,7 +44,7 @@ func (c *Client) ListVariables(ctx context.Context, scope Scope, opts VariableSc
 		}
 		vars, err := c.cloud.ListWorkspaceVariables(ctx, scope.Workspace, cloud.VariableListOptions{})
 		if err != nil {
-			return nil, mapHTTPError(err, "variables")
+			return nil, c.mapErr(err, "variables")
 		}
 		return mapVars(vars, VariableScopeWorkspace), nil
 	case VariableScopeDeployment:
@@ -54,7 +54,7 @@ func (c *Client) ListVariables(ctx context.Context, scope Scope, opts VariableSc
 		}
 		vars, err := c.cloud.ListDeploymentVariables(ctx, scope.Workspace, scope.RepoSlug, envUUID, cloud.VariableListOptions{})
 		if err != nil {
-			return nil, mapHTTPError(err, "variables")
+			return nil, c.mapErr(err, "variables")
 		}
 		return mapVars(vars, VariableScopeDeployment), nil
 	default: // repo
@@ -63,7 +63,7 @@ func (c *Client) ListVariables(ctx context.Context, scope Scope, opts VariableSc
 		}
 		vars, err := c.cloud.ListRepositoryVariables(ctx, scope.Workspace, scope.RepoSlug, cloud.VariableListOptions{})
 		if err != nil {
-			return nil, mapHTTPError(err, "variables")
+			return nil, c.mapErr(err, "variables")
 		}
 		return mapVars(vars, VariableScopeRepo), nil
 	}
@@ -106,7 +106,7 @@ func (c *Client) SetVariable(ctx context.Context, scope Scope, name, value strin
 				Key: name, Value: value, Secured: secured,
 			})
 			if err != nil {
-				return nil, false, mapHTTPError(err, "variable "+name)
+				return nil, false, c.mapErr(err, "variable "+name)
 			}
 			m := mapVar(*v, VariableScopeWorkspace)
 			return &m, false, nil
@@ -115,7 +115,7 @@ func (c *Client) SetVariable(ctx context.Context, scope Scope, name, value strin
 			Key: name, Value: value, Secured: secured,
 		})
 		if err != nil {
-			return nil, false, mapHTTPError(err, "variable "+name)
+			return nil, false, c.mapErr(err, "variable "+name)
 		}
 		m := mapVar(*v, VariableScopeWorkspace)
 		return &m, true, nil
@@ -129,7 +129,7 @@ func (c *Client) SetVariable(ctx context.Context, scope Scope, name, value strin
 				Key: name, Value: value, Secured: secured,
 			})
 			if err != nil {
-				return nil, false, mapHTTPError(err, "variable "+name)
+				return nil, false, c.mapErr(err, "variable "+name)
 			}
 			m := mapVar(*v, VariableScopeDeployment)
 			return &m, false, nil
@@ -138,7 +138,7 @@ func (c *Client) SetVariable(ctx context.Context, scope Scope, name, value strin
 			Key: name, Value: value, Secured: secured,
 		})
 		if err != nil {
-			return nil, false, mapHTTPError(err, "variable "+name)
+			return nil, false, c.mapErr(err, "variable "+name)
 		}
 		m := mapVar(*v, VariableScopeDeployment)
 		return &m, true, nil
@@ -151,7 +151,7 @@ func (c *Client) SetVariable(ctx context.Context, scope Scope, name, value strin
 				Key: name, Value: value, Secured: secured,
 			})
 			if err != nil {
-				return nil, false, mapHTTPError(err, "variable "+name)
+				return nil, false, c.mapErr(err, "variable "+name)
 			}
 			m := mapVar(*v, VariableScopeRepo)
 			return &m, false, nil
@@ -160,7 +160,7 @@ func (c *Client) SetVariable(ctx context.Context, scope Scope, name, value strin
 			Key: name, Value: value, Secured: secured,
 		})
 		if err != nil {
-			return nil, false, mapHTTPError(err, "variable "+name)
+			return nil, false, c.mapErr(err, "variable "+name)
 		}
 		m := mapVar(*v, VariableScopeRepo)
 		return &m, true, nil
@@ -187,7 +187,7 @@ func (c *Client) DeleteVariable(ctx context.Context, scope Scope, name string, o
 			if isNotFound(err) {
 				return false, nil
 			}
-			return false, mapHTTPError(err, "variable "+name)
+			return false, c.mapErr(err, "variable "+name)
 		}
 	case VariableScopeDeployment:
 		envUUID, err := c.resolveDeploymentEnv(ctx, scope, o.Env)
@@ -198,14 +198,14 @@ func (c *Client) DeleteVariable(ctx context.Context, scope Scope, name string, o
 			if isNotFound(err) {
 				return false, nil
 			}
-			return false, mapHTTPError(err, "variable "+name)
+			return false, c.mapErr(err, "variable "+name)
 		}
 	default: // repo
 		if err := c.cloud.DeleteRepositoryVariable(ctx, scope.Workspace, scope.RepoSlug, existing.UUID); err != nil {
 			if isNotFound(err) {
 				return false, nil
 			}
-			return false, mapHTTPError(err, "variable "+name)
+			return false, c.mapErr(err, "variable "+name)
 		}
 	}
 	return true, nil
@@ -241,7 +241,7 @@ func (c *Client) resolveDeploymentEnv(ctx context.Context, scope Scope, env stri
 	}
 	envs, err := c.cloud.ListDeploymentEnvironments(ctx, scope.Workspace, scope.RepoSlug)
 	if err != nil {
-		return "", mapHTTPError(err, "deployment environments")
+		return "", c.mapErr(err, "deployment environments")
 	}
 	for _, e := range envs {
 		if strings.EqualFold(e.Name, env) || strings.EqualFold(e.Slug, env) {

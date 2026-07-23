@@ -18,7 +18,7 @@ func (c *Client) ListProjects(ctx context.Context, limit int) ([]Project, error)
 	}
 	projects, err := c.dc.ListProjects(ctx, limit)
 	if err != nil {
-		return nil, mapHTTPError(err, "projects")
+		return nil, c.mapErr(err, "projects")
 	}
 	out := make([]Project, 0, len(projects))
 	for i := range projects {

@@ -615,9 +615,13 @@ func appendErrorDetails(b *strings.Builder, details []string) {
 }
 
 // HTTPError preserves the response status code for callers that need stable
-// classification while keeping the historical error text unchanged.
+// classification while keeping the historical error text unchanged. RetryAfter,
+// when positive, carries the server-advertised cooldown parsed from the
+// Retry-After response header (seconds); the error map folds it into the
+// agent-facing RATE_LIMITED hint.
 type HTTPError struct {
 	StatusCode int
+	RetryAfter time.Duration
 	text       string
 }
 
@@ -630,7 +634,32 @@ func newHTTPError(resp *http.Response, message ...string) *HTTPError {
 	if len(message) > 0 {
 		text += ": " + message[0]
 	}
-	return &HTTPError{StatusCode: resp.StatusCode, text: text}
+	return &HTTPError{
+		StatusCode: resp.StatusCode,
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		text:       text,
+	}
+}
+
+// parseRetryAfter converts a Retry-After header (delta-seconds form) to a
+// duration. An empty or non-integer value yields a zero duration (unknown); a
+// delta larger than an hour is capped so a misbehaving server cannot pin a
+// caller indefinitely. The HTTP-date form is intentionally unsupported here
+// because Bitbucket advertises delta-seconds.
+func parseRetryAfter(header string) time.Duration {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(header)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	d := time.Duration(secs) * time.Second
+	if d > time.Hour {
+		d = time.Hour
+	}
+	return d
 }
 
 // isCaptchaException checks if the exception name indicates a CAPTCHA-locked account.

@@ -53,7 +53,7 @@ func (c *Client) ListPipelines(ctx context.Context, scope Scope, opts PipelineLi
 	limit := clampPipelineLimit(opts.Limit)
 	pipelines, err := c.cloud.ListPipelines(ctx, scope.Workspace, scope.RepoSlug, limit)
 	if err != nil {
-		return nil, mapHTTPError(err, "pipelines")
+		return nil, c.mapErr(err, "pipelines")
 	}
 	out := make([]Pipeline, 0, len(pipelines))
 	for i := range pipelines {
@@ -72,7 +72,7 @@ func (c *Client) GetPipeline(ctx context.Context, scope Scope, buildNumber int) 
 	}
 	p, err := c.cloud.GetPipelineByBuildNumber(ctx, scope.Workspace, scope.RepoSlug, buildNumber)
 	if err != nil {
-		return nil, mapHTTPError(err, fmt.Sprintf("pipeline #%d", buildNumber))
+		return nil, c.mapErr(err, fmt.Sprintf("pipeline #%d", buildNumber))
 	}
 	m := mapCloudPipeline(p)
 	return &m, nil
@@ -89,7 +89,7 @@ func (c *Client) ListPipelineSteps(ctx context.Context, scope Scope, pipelineUUI
 	}
 	steps, err := c.cloud.ListPipelineSteps(ctx, scope.Workspace, scope.RepoSlug, pipelineUUID)
 	if err != nil {
-		return nil, mapHTTPError(err, "pipeline steps")
+		return nil, c.mapErr(err, "pipeline steps")
 	}
 	out := make([]PipelineStep, 0, len(steps))
 	for i := range steps {

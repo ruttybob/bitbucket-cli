@@ -27,7 +27,7 @@ func (c *Client) PRHeadStatuses(ctx context.Context, scope Scope, id int) ([]Bui
 	}
 	pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 	if err != nil {
-		return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+		return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 	}
 	sha := strings.TrimSpace(pr.FromRef.LatestCommit)
 	if sha == "" {

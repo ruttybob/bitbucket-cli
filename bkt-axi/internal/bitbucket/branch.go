@@ -42,7 +42,7 @@ func (c *Client) listBranchesCloud(ctx context.Context, scope Scope, opts Branch
 		Limit:  limit,
 	})
 	if err != nil {
-		return nil, mapHTTPError(err, "branches")
+		return nil, c.mapErr(err, "branches")
 	}
 	out := make([]Branch, 0, len(branches))
 	for i := range branches {
@@ -66,7 +66,7 @@ func (c *Client) listBranchesDC(ctx context.Context, scope Scope, opts BranchLis
 		Limit:  limit,
 	})
 	if err != nil {
-		return nil, mapHTTPError(err, "branches")
+		return nil, c.mapErr(err, "branches")
 	}
 	out := make([]Branch, 0, len(branches))
 	for i := range branches {
@@ -160,7 +160,7 @@ func (c *Client) CreateBranch(ctx context.Context, scope Scope, in CreateBranchI
 	if startPoint == "" {
 		def, err := c.dc.GetRepository(ctx, scope.ProjectKey, scope.RepoSlug)
 		if err != nil {
-			return nil, mapHTTPError(err, "repository")
+			return nil, c.mapErr(err, "repository")
 		}
 		startPoint = def.DefaultBranch
 	}
@@ -173,7 +173,7 @@ func (c *Client) CreateBranch(ctx context.Context, scope Scope, in CreateBranchI
 		Message:    in.Message,
 	})
 	if err != nil {
-		return nil, mapHTTPError(err, "branch")
+		return nil, c.mapErr(err, "branch")
 	}
 	return &BranchMutation{Name: branch.DisplayID}, nil
 }
@@ -192,7 +192,7 @@ func (c *Client) DeleteBranch(ctx context.Context, scope Scope, name string, dry
 		return fmt.Errorf("branch name is required as the positional argument")
 	}
 	if err := c.dc.DeleteBranch(ctx, scope.ProjectKey, scope.RepoSlug, name, dryRun); err != nil {
-		return mapHTTPError(err, "branch")
+		return c.mapErr(err, "branch")
 	}
 	return nil
 }

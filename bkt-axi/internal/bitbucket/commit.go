@@ -26,7 +26,7 @@ func (c *Client) GetCommit(ctx context.Context, scope Scope, sha string) (*Commi
 		}
 		commit, err := c.cloud.GetCommit(ctx, scope.Workspace, scope.RepoSlug, sha)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("commit %s", sha))
+			return nil, c.mapErr(err, fmt.Sprintf("commit %s", sha))
 		}
 		m := mapCloudCommit(commit)
 		return &m, nil
@@ -36,7 +36,7 @@ func (c *Client) GetCommit(ctx context.Context, scope Scope, sha string) (*Commi
 		}
 		commit, err := c.dc.GetCommit(ctx, scope.ProjectKey, scope.RepoSlug, sha)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("commit %s", sha))
+			return nil, c.mapErr(err, fmt.Sprintf("commit %s", sha))
 		}
 		m := mapDCCommit(commit)
 		return &m, nil
@@ -59,14 +59,14 @@ func (c *Client) CommitDiff(ctx context.Context, scope Scope, from, to string) (
 		}
 		spec := from + ".." + to
 		if err := c.cloud.CommitDiff(ctx, scope.Workspace, scope.RepoSlug, spec, &b); err != nil {
-			return "", mapHTTPError(err, "diff")
+			return "", c.mapErr(err, "diff")
 		}
 	case KindDC:
 		if scope.ProjectKey == "" || scope.RepoSlug == "" {
 			return "", fmt.Errorf("project and repo are required; use --project/--repo or set a context")
 		}
 		if err := c.dc.CommitDiff(ctx, scope.ProjectKey, scope.RepoSlug, from, to, &b); err != nil {
-			return "", mapHTTPError(err, "diff")
+			return "", c.mapErr(err, "diff")
 		}
 	default:
 		return "", fmt.Errorf("unsupported host kind %q", c.Kind)
@@ -86,7 +86,7 @@ func (c *Client) CommitStatuses(ctx context.Context, scope Scope, sha string) ([
 		}
 		statuses, err := c.cloud.CommitStatuses(ctx, scope.Workspace, scope.RepoSlug, sha)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("statuses for commit %s", sha))
+			return nil, c.mapErr(err, fmt.Sprintf("statuses for commit %s", sha))
 		}
 		out := make([]BuildStatus, 0, len(statuses))
 		for i := range statuses {
@@ -96,7 +96,7 @@ func (c *Client) CommitStatuses(ctx context.Context, scope Scope, sha string) ([
 	case KindDC:
 		statuses, err := c.dc.CommitStatuses(ctx, sha)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("statuses for commit %s", sha))
+			return nil, c.mapErr(err, fmt.Sprintf("statuses for commit %s", sha))
 		}
 		out := make([]BuildStatus, 0, len(statuses))
 		for i := range statuses {

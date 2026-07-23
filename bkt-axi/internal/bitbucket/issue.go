@@ -37,7 +37,7 @@ func (c *Client) ListIssues(ctx context.Context, scope Scope, opts IssueListOpti
 		Limit: limit,
 	})
 	if err != nil {
-		return nil, mapHTTPError(err, "issues")
+		return nil, c.mapErr(err, "issues")
 	}
 	out := make([]Issue, 0, len(issues))
 	for i := range issues {
@@ -69,7 +69,7 @@ func (c *Client) GetIssue(ctx context.Context, scope Scope, id int) (*Issue, err
 	}
 	issue, err := c.cloud.GetIssue(ctx, scope.Workspace, scope.RepoSlug, id)
 	if err != nil {
-		return nil, mapHTTPError(err, fmtIssue(id))
+		return nil, c.mapErr(err, fmtIssue(id))
 	}
 	m := mapCloudIssue(issue)
 	return &m, nil
@@ -100,7 +100,7 @@ func (c *Client) CreateIssue(ctx context.Context, scope Scope, in IssueCreateInp
 		Assignee: in.Assignee,
 	})
 	if err != nil {
-		return nil, mapHTTPError(err, "issue")
+		return nil, c.mapErr(err, "issue")
 	}
 	m := mapCloudIssue(issue)
 	return &m, nil
@@ -132,7 +132,7 @@ func (c *Client) UpdateIssue(ctx context.Context, scope Scope, id int, in IssueE
 		Assignee: in.Assignee,
 	})
 	if err != nil {
-		return nil, mapHTTPError(err, fmtIssue(id))
+		return nil, c.mapErr(err, fmtIssue(id))
 	}
 	m := mapCloudIssue(issue)
 	return &m, nil
@@ -154,7 +154,7 @@ func (c *Client) CloseIssue(ctx context.Context, scope Scope, id int) (*Issue, b
 	state := "resolved"
 	issue, err := c.cloud.UpdateIssue(ctx, scope.Workspace, scope.RepoSlug, id, cloud.UpdateIssueInput{State: &state})
 	if err != nil {
-		return nil, false, mapHTTPError(err, fmtIssue(id))
+		return nil, false, c.mapErr(err, fmtIssue(id))
 	}
 	m := mapCloudIssue(issue)
 	return &m, true, nil
@@ -176,7 +176,7 @@ func (c *Client) ReopenIssue(ctx context.Context, scope Scope, id int) (*Issue, 
 	state := "open"
 	issue, err := c.cloud.UpdateIssue(ctx, scope.Workspace, scope.RepoSlug, id, cloud.UpdateIssueInput{State: &state})
 	if err != nil {
-		return nil, false, mapHTTPError(err, fmtIssue(id))
+		return nil, false, c.mapErr(err, fmtIssue(id))
 	}
 	m := mapCloudIssue(issue)
 	return &m, true, nil
@@ -191,7 +191,7 @@ func (c *Client) CreateIssueComment(ctx context.Context, scope Scope, id int, bo
 		return fmt.Errorf("workspace and repo are required")
 	}
 	if _, err := c.cloud.CreateIssueComment(ctx, scope.Workspace, scope.RepoSlug, id, body); err != nil {
-		return mapHTTPError(err, fmtIssue(id))
+		return c.mapErr(err, fmtIssue(id))
 	}
 	return nil
 }
@@ -206,7 +206,7 @@ func (c *Client) ListIssueComments(ctx context.Context, scope Scope, id int) ([]
 	}
 	comments, err := c.cloud.ListIssueComments(ctx, scope.Workspace, scope.RepoSlug, id, 100)
 	if err != nil {
-		return nil, mapHTTPError(err, fmtIssue(id))
+		return nil, c.mapErr(err, fmtIssue(id))
 	}
 	out := make([]Comment, 0, len(comments))
 	for i := range comments {
@@ -225,7 +225,7 @@ func (c *Client) ListIssueAttachments(ctx context.Context, scope Scope, id int) 
 	}
 	atts, err := c.cloud.ListIssueAttachments(ctx, scope.Workspace, scope.RepoSlug, id)
 	if err != nil {
-		return nil, mapHTTPError(err, fmtIssue(id))
+		return nil, c.mapErr(err, fmtIssue(id))
 	}
 	out := make([]IssueAttachment, 0, len(atts))
 	for i := range atts {
@@ -244,7 +244,7 @@ func (c *Client) UploadIssueAttachment(ctx context.Context, scope Scope, id int,
 	}
 	att, err := c.cloud.UploadIssueAttachment(ctx, scope.Workspace, scope.RepoSlug, id, filename, r)
 	if err != nil {
-		return nil, mapHTTPError(err, fmtIssue(id))
+		return nil, c.mapErr(err, fmtIssue(id))
 	}
 	return &IssueAttachment{Name: att.Name, URL: att.Links.Self.Href}, nil
 }
@@ -258,7 +258,7 @@ func (c *Client) DownloadIssueAttachment(ctx context.Context, scope Scope, id in
 		return fmt.Errorf("workspace and repo are required")
 	}
 	if err := c.cloud.DownloadIssueAttachment(ctx, scope.Workspace, scope.RepoSlug, id, filename, w); err != nil {
-		return mapHTTPError(err, fmt.Sprintf("attachment %q on issue #%d", filename, id))
+		return c.mapErr(err, fmt.Sprintf("attachment %q on issue #%d", filename, id))
 	}
 	return nil
 }
@@ -272,7 +272,7 @@ func (c *Client) DeleteIssueAttachment(ctx context.Context, scope Scope, id int,
 		return fmt.Errorf("workspace and repo are required")
 	}
 	if err := c.cloud.DeleteIssueAttachment(ctx, scope.Workspace, scope.RepoSlug, id, filename); err != nil {
-		return mapHTTPError(err, fmt.Sprintf("attachment %q on issue #%d", filename, id))
+		return c.mapErr(err, fmt.Sprintf("attachment %q on issue #%d", filename, id))
 	}
 	return nil
 }

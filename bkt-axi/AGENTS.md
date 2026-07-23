@@ -54,6 +54,11 @@ checks into command files — extend the adapter.
   `api <path>`) and grouped nouns (`pr reviewer list <id>`, `perms project grant
   <k> <u> <p>`) need no dispatcher changes. Leaf nouns (`api`, `context`'s
   verbs) run directly.
+- **Deprecation alias layer** (`internal/app/deprecated.go`): old `bkt`/pre-consolidation
+  forms (`pr suggestion`, `pr reviewer-group`, `pr publish`, `pr auto-merge`,
+  `pr reaction`, `repo browse`) are intercepted at the unknown-child point and
+  emit a one-line notice naming the new command (exit 2). Migration aid only —
+  old verbs are not emulated.
 - Flag types: `FlagString`, `FlagInt`, `FlagBool`, and `FlagStringSlice`
   (repeatable). A `Flag.Short` (single char) gives a `-X` alias; the only one in
   use is `api --field`/`-F`.
@@ -71,10 +76,15 @@ checks into command files — extend the adapter.
   `branch.go` — same one-switch principle as `pr.go`. They return the normalized
   resource plus an `Already bool` (`PRMutation`, `BranchMutation`); commands
   render the `(already — no-op)` suffix when `Already` is true and exit 0.
-- Idempotency is implemented with **explicit state pre-checks** in the adapter
+- **Idempotency is implemented with explicit state pre-checks** in the adapter
   (GET, compare target state), NOT by mapping 409s to no-ops. A residual 409
   that is not "already in target state" is a real `CONFLICT` (exit 1). This is
   why the adapter — not `errormap.go`'s `idempotent=true` path — owns no-ops.
+- **Error translation chokepoint is `Client.mapErr`** (`internal/bitbucket/httperr.go`):
+  every adapter call site funnels errors through it. It routes `*httpx.HTTPError`
+  through `axi.MapError` (threading host kind + Retry-After) and any non-HTTP
+  transport failure (timeout, refused connection) through `axi.MapTransportError`
+  → `NETWORK_ERROR`. `axi.MapError` is the comprehensive status→code table; `axi.MapHTTPError` is the legacy thin wrapper kept for the raw `api` passthrough.
 - DC optimistic concurrency: `dcMutate` GETs the version, retries once on a 409
   stale-version after re-fetching (and re-checking state). Use it for any
   version-gated DC mutation (merge/decline/reopen/edit).

@@ -377,6 +377,12 @@ func (a *App) dispatch(argv []string) error {
 		}
 		child := cmd.findChild(rest[0])
 		if child == nil {
+			// Before reporting a generic unknown command, check the migration
+			// shim: an old `bkt`/pre-consolidation form ("pr suggestion") maps
+			// to a one-line deprecation notice naming the new command.
+			if d := resolveDeprecated(cmd.path(), rest[0]); d != nil {
+				return deprecationError(d)
+			}
 			return unknownCommandErr(rest[0], cmd.childNames())
 		}
 		cmd = child
