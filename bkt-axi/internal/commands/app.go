@@ -22,6 +22,10 @@ func NewApp(binPath string) *app.App {
 		Commands: []*app.Command{
 			NewPRCmd(),
 			NewAuthCmd(),
+			NewRepoCmd(),
+			NewBranchCmd(),
+			NewCommitCmd(),
+			NewPipelineCmd(),
 		},
 	}
 	a.Home = RunHome

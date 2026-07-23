@@ -332,6 +332,12 @@ func checksLabel(total, passed, failed int) string {
 }
 
 func humanizeTime(t time.Time) string {
+	// A zero time means "absent" (e.g. a Cloud commit with no committer
+	// timestamp); render it as empty rather than the ~2000-year "54y ago" that
+	// time.Since(zero) would otherwise produce.
+	if t.IsZero() {
+		return ""
+	}
 	d := time.Since(t)
 	abs := d
 	future := false
