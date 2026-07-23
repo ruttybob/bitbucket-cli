@@ -21,14 +21,14 @@ agent must know to work here without re-deriving it.
 ## The one-switch principle
 
 Every old command switched on `host.Kind`. Here that switch lives **once**, in
-the adapter: `pr.go`, `repo.go`, `branch.go`, `commit.go`, `pipeline.go`
-(`internal/bitbucket/`). Commands call e.g. `client.ListPRs(...)` and get
-normalized `[]bitbucket.PR`; `client.ListRepos`, `ListBranches`, `GetCommit`,
-`CommitDiff`, `CommitStatuses`, `ListPipelines`, … all return normalized
-domain models. Never sprinkle `cloud`/`dc` checks into command files — extend
-the adapter.
+the adapter: `pr.go`, `repo.go`, `branch.go`, `commit.go`, `pipeline.go`,
+`issue.go`, `webhook.go`, `variable.go`, `project.go`, `status.go`, `perms.go`,
+`admin.go`, `pr_ext.go` (`internal/bitbucket/`). Commands call e.g.
+`client.ListPRs(...)` / `ListIssues(...)` / `ListRepos` / `GetCommit` /
+`ListPipelines` / … and get normalized domain models. Never sprinkle `cloud`/`dc`
+checks into command files — extend the adapter.
 
-- **Cloud-only nouns** (pipelines): the adapter guards with `bitbucket.CloudOnly(feature, c.hostKindLabel())`, which renders `pipelines is Bitbucket Cloud only; the active host is Bitbucket Data Center`. Use the same helper for any DC-only command added later (swap the wording to "Data Center only").
+- **Platform-restricted nouns**: the adapter guards with the shared `CloudOnly(feature, c.hostKindLabel())` / `DCOnly(feature, c.hostKindLabel())` helpers (`internal/bitbucket/guards.go`), which render `pipelines is Bitbucket Cloud only; the active host is Bitbucket Data Center` (and the DC-only mirror). `c.hostKindLabel()` resolves the active host to its product name. Use these for any platform-restricted command.
 - **Opt-in commit-derived fields**: branch `message`/`author`/`updated` and pipeline `steps` are not on the list payload, so the adapter fetches them per row only when requested via `--fields` (one extra request per row). Keep such extras opt-in.
 
 ## Output contract (do not regress)
@@ -47,8 +47,20 @@ the adapter.
 ## Commands
 
 - Add nouns/verbs in `internal/commands/` and register them in `NewApp`
-  (`internal/commands/app.go`). The dispatcher (`internal/app`) needs no changes
-  for new commands.
+  (`internal/commands/app.go`).
+- The dispatcher (`internal/app`) walks the command tree to **arbitrary depth**:
+  it descends through named children until a leaf (`Run != nil`) is reached, then
+  parses the rest as flags+positionals. So both shallow commands (`pr list`,
+  `api <path>`) and grouped nouns (`pr reviewer list <id>`, `perms project grant
+  <k> <u> <p>`) need no dispatcher changes. Leaf nouns (`api`, `context`'s
+  verbs) run directly.
+- Flag types: `FlagString`, `FlagInt`, `FlagBool`, and `FlagStringSlice`
+  (repeatable). A `Flag.Short` (single char) gives a `-X` alias; the only one in
+  use is `api --field`/`-F`.
+- Command rendering helpers (`emitList`/`emitEmpty`/`emitDetail`/
+  `emitConfirmation`, `resolveExtraFields`, `bodyFromFlags`) live in
+  `internal/commands/helpers.go`; reuse them instead of re-deriving the TOON/JSON
+  dual payload.
 - Help blocks and the home view render automatically; do not hand-write TOON
   help strings outside `internal/axi` + `internal/app/help.go`.
 - **List-command checklist**: default minimal schema; `--fields` extras extend it via `extendSchema` (one `extraFields` map per command; unknown values exit 2 with the allowed list); a `count:` line via `countLine` (`N of M total` / `N shown (more available)` / bare `N`); and a `help[]` block from `internal/axi/suggest.go`. Detail commands truncate large fields with a `--full` escape hatch. `--json`/`--yaml` payloads are built from the same schema via `listPayloadRows`/`detailExtracted`.

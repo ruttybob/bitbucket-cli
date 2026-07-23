@@ -172,3 +172,112 @@ type BuildStatus struct {
 	URL         string `toon:"url"`
 	Description string `toon:"description"`
 }
+
+// --- Phase 3 normalized models ------------------------------------------
+//
+// Each noun below mirrors the §one-switch principle: the command layer reads
+// one struct regardless of host kind; the per-line mapping lives once in the
+// matching adapter file (issue.go, webhook.go, …).
+
+// Issue is the normalized Bitbucket Cloud issue. DC's issue tracker was
+// removed in modern releases, so issues are Cloud-only.
+type Issue struct {
+	ID        int       `toon:"id"`
+	Title     string    `toon:"title"`
+	State     string    `toon:"state"` // new|open|resolved|closed|duplicate|invalid|wontfix|on hold (lowercased)
+	Priority  string    `toon:"priority"`
+	Kind      string    `toon:"kind"`
+	Assignee  string    `toon:"assignee"`
+	Reporter  string    `toon:"reporter"`
+	Content   string    `toon:"content"`
+	URL       string    `toon:"url"`
+	CreatedAt time.Time `toon:"created_at"`
+	UpdatedAt time.Time `toon:"updated_at"`
+}
+
+// IssueListResult bundles a bounded issue page with pagination metadata.
+type IssueListResult struct {
+	Issues        []Issue
+	Shown         int
+	MoreAvailable bool
+}
+
+// Webhook is the normalized repository webhook. ID is the API's opaque
+// identifier rendered as a string (Cloud UUID or DC numeric id-as-string).
+type Webhook struct {
+	ID      string   `toon:"id"`
+	Name    string   `toon:"name"` // DC name / Cloud description
+	URL     string   `toon:"url"`
+	Active  bool     `toon:"active"`
+	Events  []string `toon:"events"`
+	Created string   `toon:"created"` // best-effort; empty when the API omits it
+}
+
+// WebhookListResult bundles a bounded webhook page with pagination metadata.
+type WebhookListResult struct {
+	Webhooks      []Webhook
+	Shown         int
+	MoreAvailable bool
+}
+
+// Variable is the normalized Bitbucket Cloud pipeline variable, scoped to
+// repo, workspace, or a deployment environment.
+type Variable struct {
+	Key     string `toon:"key"`
+	Value   string `toon:"value"`
+	Secured bool   `toon:"secured"`
+	Scope   string `toon:"scope"` // repo|workspace|deployment
+	UUID    string `toon:"-"`     // internal: API identity for update/delete
+}
+
+// Project is the normalized Bitbucket Data Center project.
+type Project struct {
+	Key         string `toon:"key"`
+	Name        string `toon:"name"`
+	Description string `toon:"description"`
+}
+
+// Permission is the normalized Data Center user permission assignment.
+type Permission struct {
+	User       string `toon:"user"`
+	Permission string `toon:"permission"`
+}
+
+// PullRequestTask is the normalized pull request task (Data Center blocker
+// comment surfaced as a checkable task).
+type PullRequestTask struct {
+	ID     int    `toon:"id"`
+	State  string `toon:"state"` // open|resolved (lowercased)
+	Text   string `toon:"text"`
+	Author string `toon:"author"`
+}
+
+// RateLimitInfo is the normalized rate-limit telemetry derived from response
+// headers (Cloud has no clean rate-limit endpoint; DC surfaces headers too).
+type RateLimitInfo struct {
+	Limit     int       `toon:"limit"`
+	Remaining int       `toon:"remaining"`
+	Reset     time.Time `toon:"reset"`
+	Source    string    `toon:"source"`
+}
+
+// Reviewer is the normalized pull request reviewer (used by `pr reviewer list`).
+type Reviewer struct {
+	Name     string `toon:"name"`
+	State    string `toon:"state"` // approved|changes_requested|unreviewed
+	Approved bool   `toon:"approved"`
+}
+
+// Suggestion is the normalized inline code suggestion on a pull request.
+type Suggestion struct {
+	ID        int    `toon:"id"`
+	CommentID int    `toon:"comment_id"`
+	Text      string `toon:"text"`
+	Applied   bool   `toon:"applied"`
+}
+
+// IssueAttachment is the normalized Bitbucket Cloud issue attachment.
+type IssueAttachment struct {
+	Name string `toon:"name"`
+	URL  string `toon:"url"`
+}

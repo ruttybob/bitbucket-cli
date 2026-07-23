@@ -18,12 +18,17 @@ const (
 	FlagString FlagType = iota
 	FlagInt
 	FlagBool
+	// FlagStringSlice is a repeatable string flag: each occurrence appends to
+	// the value (e.g. --field k1=v1 --field k2=v2). Used by raw-passthrough
+	// commands that build up a body from repeated key=value pairs.
+	FlagStringSlice
 )
 
 // Flag declares one known flag on a command. The declared set is authoritative:
 // any flag not present here (and not global) is rejected by name with exit 2.
 type Flag struct {
 	Name    string
+	Short   string // optional single-char alias (e.g. "F" → -F); empty disables it
 	Type    FlagType
 	Default any
 	Desc    string

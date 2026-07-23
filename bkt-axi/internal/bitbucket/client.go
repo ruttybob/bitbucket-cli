@@ -98,3 +98,16 @@ func newDCClient(host *config.Host) (*dc.Client, error) {
 	}
 	return dc.New(opts)
 }
+
+// HTTP exposes the underlying line-specific httpx client for raw-passthrough
+// use (the `api` command). Commands should prefer normalized adapter methods;
+// this escape hatch exists for endpoints the adapter layer does not yet model.
+func (c *Client) HTTP() *httpx.Client {
+	switch c.Kind {
+	case KindCloud:
+		return c.cloud.HTTP()
+	case KindDC:
+		return c.dc.HTTP()
+	}
+	return nil
+}
