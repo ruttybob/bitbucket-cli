@@ -53,6 +53,22 @@ the adapter.
   help strings outside `internal/axi` + `internal/app/help.go`.
 - **List-command checklist**: default minimal schema; `--fields` extras extend it via `extendSchema` (one `extraFields` map per command; unknown values exit 2 with the allowed list); a `count:` line via `countLine` (`N of M total` / `N shown (more available)` / bare `N`); and a `help[]` block from `internal/axi/suggest.go`. Detail commands truncate large fields with a `--full` escape hatch. `--json`/`--yaml` payloads are built from the same schema via `listPayloadRows`/`detailExtracted`.
 
+## Mutations & idempotency (AXI §6)
+
+- Mutation adapters live in `internal/bitbucket/pr_mutations.go`, `repo.go`,
+  `branch.go` — same one-switch principle as `pr.go`. They return the normalized
+  resource plus an `Already bool` (`PRMutation`, `BranchMutation`); commands
+  render the `(already — no-op)` suffix when `Already` is true and exit 0.
+- Idempotency is implemented with **explicit state pre-checks** in the adapter
+  (GET, compare target state), NOT by mapping 409s to no-ops. A residual 409
+  that is not "already in target state" is a real `CONFLICT` (exit 1). This is
+  why the adapter — not `errormap.go`'s `idempotent=true` path — owns no-ops.
+- DC optimistic concurrency: `dcMutate` GETs the version, retries once on a 409
+  stale-version after re-fetching (and re-checking state). Use it for any
+  version-gated DC mutation (merge/decline/reopen/edit).
+- Git shell-out for `pr checkout` / `repo clone` and inference (`--source`,
+  `--title` defaults) live in `internal/git/run.go` and `inference.go`.
+
 ## Build & test
 
 ```sh

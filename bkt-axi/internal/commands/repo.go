@@ -3,27 +3,30 @@ package commands
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/ruttybob/bkt-axi/internal/app"
 	"github.com/ruttybob/bkt-axi/internal/axi"
 	"github.com/ruttybob/bkt-axi/internal/bitbucket"
+	"github.com/ruttybob/bkt-axi/internal/git"
 )
 
-// repo.go implements the Phase 1 repository commands: `repo list` and
-// `repo view`. Each resolves the unified client and scope from flags/context,
-// calls the normalized adapter, and renders TOON (or --json/--yaml). The
-// cloud/dc switch lives entirely inside the adapter.
+// repo.go implements the repository commands: the Phase 1 read verbs `repo
+// list` and `repo view`, and the Phase 2 mutation verbs `repo create` and
+// `repo clone`.
 
-// NewRepoCmd builds the `repo` noun and its Phase 1 verbs.
+// NewRepoCmd builds the `repo` noun and its verbs.
 func NewRepoCmd() *app.Command {
 	return &app.Command{
 		Name:  "repo",
 		Short: "Work with repositories",
-		Long:  "List and inspect repositories across Bitbucket Cloud and Data Center.",
+		Long:  "List, inspect, create, and clone repositories across Bitbucket Cloud and Data Center.",
 		Children: []*app.Command{
 			newRepoListCmd(),
 			newRepoViewCmd(),
+			newRepoCreateCmd(),
+			newRepoCloneCmd(),
 		},
 	}
 }
@@ -236,4 +239,192 @@ func listPayloadRows(label string, count any, items []any, schema []axi.Field, h
 // detailExtracted projects one item through schema for the JSON/YAML payload.
 func detailExtracted(item any, schema []axi.Field) map[string]any {
 	return axi.Extract(item, schema)
+}
+
+// --- mutations (Phase 2) -------------------------------------------------
+
+// repoDetailSchema is the ordered field set for the repo detail confirm.
+func repoDetailSchema() []axi.Field {
+	return []axi.Field{
+		{Key: "slug", Extractor: axi.Pluck("slug")},
+		{Key: "name", Extractor: axi.Pluck("name")},
+		{Key: "scm", Extractor: axi.Pluck("scm")},
+		{Key: "project", Extractor: axi.Pluck("project")},
+		{Key: "workspace", Extractor: axi.Pluck("workspace")},
+		{Key: "default_branch", Extractor: axi.Pluck("default_branch")},
+		{Key: "clone_https", Extractor: axi.Pluck("clone_https")},
+		{Key: "clone_ssh", Extractor: axi.Pluck("clone_ssh")},
+		{Key: "url", Extractor: axi.Pluck("url")},
+	}
+}
+
+// emitRepoDetail renders the normalized repository as a detail document.
+func emitRepoDetail(ctx *app.Context, repo *bitbucket.Repo) {
+	doc := axi.NewObject(axi.KV{Key: "repository", Value: axi.NewObject(axi.Ordered(*repo, repoDetailSchema())...)})
+	emit(ctx, detailRepoPayload(repo), axi.Marshal(doc))
+}
+
+func detailRepoPayload(repo *bitbucket.Repo) map[string]any {
+	return map[string]any{
+		"repository": map[string]any{
+			"slug":           repo.Slug,
+			"name":           repo.Name,
+			"scm":            repo.SCM,
+			"project":        repo.Project,
+			"workspace":      repo.Workspace,
+			"default_branch": repo.DefaultBranch,
+			"clone_https":    repo.CloneHTTPS,
+			"clone_ssh":      repo.CloneSSH,
+			"url":            repo.URL,
+		},
+	}
+}
+
+// --- repo create ---------------------------------------------------------
+
+func newRepoCreateCmd() *app.Command {
+	flags := append(app.FlagSet{
+		{Name: "public", Type: app.FlagBool, Default: false, Desc: "Make the repository public (private by default)"},
+		{Name: "description", Type: app.FlagString, Default: "", Desc: "Repository description"},
+		{Name: "scm", Type: app.FlagString, Default: "git", Desc: "Source control management (default git)"},
+		{Name: "default-branch", Type: app.FlagString, Default: "", Desc: "Default branch name"},
+		{Name: "forkable", Type: app.FlagBool, Default: false, Desc: "Data Center: allow forks"},
+		{Name: "cloud-project", Type: app.FlagString, Default: "", Desc: "Cloud: project key to create the repository under"},
+	}, selectorFlags()...)
+	return &app.Command{
+		Name:    "create",
+		Short:   "Create a repository",
+		Long:    "Create a repository. The positional argument is the repository slug on Cloud, or the repository name on Data Center (which derives the slug). --workspace (Cloud) or --project (Data Center) is required.",
+		Flags:   flags,
+		MinArgs: 1, MaxArgs: 1,
+		Examples: []app.Example{
+			{Cmd: "bkt-axi repo create api", What: "create a private repository named api"},
+			{Cmd: "bkt-axi repo create api --public --description \"API service\"", What: "create a public repository with a description"},
+		},
+		Run: runRepoCreate,
+	}
+}
+
+func runRepoCreate(ctx *app.Context) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	scope, err := ctx.Scope()
+	if err != nil {
+		return err
+	}
+	if client.Kind == bitbucket.KindCloud && scope.Workspace == "" {
+		return axi.Errorf("a workspace is required; use --workspace or set a context")
+	}
+	if client.Kind == bitbucket.KindDC && scope.ProjectKey == "" {
+		return axi.Errorf("a project key is required; use --project or set a context")
+	}
+
+	slug := strings.TrimSpace(ctx.Args[0])
+	if slug == "" {
+		return axi.UsageError("repository slug is required as the positional argument")
+	}
+
+	repo, err := client.CreateRepo(context.Background(), scope, bitbucket.CreateRepoInput{
+		Slug:          slug,
+		Description:   ctx.Flags.String("description"),
+		SCM:           ctx.Flags.String("scm"),
+		DefaultBranch: ctx.Flags.String("default-branch"),
+		Public:        ctx.Flags.Bool("public"),
+		Forkable:      ctx.Flags.Bool("forkable"),
+		CloudProject:  ctx.Flags.String("cloud-project"),
+	})
+	if err != nil {
+		return err
+	}
+	emitRepoDetail(ctx, repo)
+	return nil
+}
+
+// --- repo clone ----------------------------------------------------------
+
+func newRepoCloneCmd() *app.Command {
+	flags := append(app.FlagSet{
+		{Name: "ssh", Type: app.FlagBool, Default: false, Desc: "Clone over SSH instead of HTTPS"},
+		{Name: "dest", Type: app.FlagString, Default: "", Desc: "Destination directory (defaults to the repository slug)"},
+	}, selectorFlags()...)
+	return &app.Command{
+		Name:    "clone",
+		Short:   "Clone a repository",
+		Long:    "Clone a repository into a new directory. Resolves the clone URL from the repository's advertised links; --ssh selects the SSH link.",
+		Flags:   flags,
+		MinArgs: 1, MaxArgs: 1,
+		Examples: []app.Example{
+			{Cmd: "bkt-axi repo clone api", What: "clone the api repository over HTTPS"},
+			{Cmd: "bkt-axi repo clone api --ssh --dest api-src", What: "clone over SSH into api-src"},
+		},
+		Run: runRepoClone,
+	}
+}
+
+func runRepoClone(ctx *app.Context) error {
+	client, err := ctx.Client()
+	if err != nil {
+		return err
+	}
+	slug := strings.TrimSpace(ctx.Args[0])
+	if slug == "" {
+		return axi.UsageError("repository slug is required as the positional argument")
+	}
+
+	// Resolve scope with the slug as the repo override so the adapter fetches
+	// the right repository's clone links.
+	overrides := ctx.ScopeOverrides()
+	overrides.RepoSlug = slug
+	resolved, err := ctx.Resolve()
+	if err != nil {
+		return err
+	}
+	scope := bitbucket.ResolveScope(resolved, overrides)
+	if client.Kind == bitbucket.KindCloud && scope.Workspace == "" {
+		return axi.Errorf("a workspace is required; use --workspace or set a context")
+	}
+	if client.Kind == bitbucket.KindDC && scope.ProjectKey == "" {
+		return axi.Errorf("a project key is required; use --project or set a context")
+	}
+
+	cloneURL, err := client.RepoCloneURL(context.Background(), scope, ctx.Flags.Bool("ssh"))
+	if err != nil {
+		return err
+	}
+	if cloneURL == "" {
+		return axi.Errorf("repository %s has no clone URL available", scope.String())
+	}
+
+	dest := strings.TrimSpace(ctx.Flags.String("dest"))
+	if dest == "" {
+		dest = slug
+	}
+	if !filepath.IsAbs(dest) {
+		if abs, derr := filepath.Abs(dest); derr == nil {
+			dest = abs
+		}
+	}
+
+	if _, e := git.Run("", "clone", cloneURL, dest); e != nil {
+		return axi.Errorf("clone %s: %s", cloneURL, e)
+	}
+
+	doc := axi.NewObject(
+		axi.KV{Key: "clone", Value: axi.NewObject(
+			axi.KV{Key: "repository", Value: scope.String()},
+			axi.KV{Key: "url", Value: cloneURL},
+			axi.KV{Key: "dest", Value: dest},
+		)},
+	)
+	payload := map[string]any{
+		"clone": map[string]any{
+			"repository": scope.String(),
+			"url":        cloneURL,
+			"dest":       dest,
+		},
+	}
+	emit(ctx, payload, axi.Marshal(doc))
+	return nil
 }

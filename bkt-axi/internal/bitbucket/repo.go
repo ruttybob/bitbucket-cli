@@ -236,3 +236,114 @@ func RepoScopeWord(scope Scope) string {
 	}
 	return "the resolved scope"
 }
+
+// --- mutations (Phase 2) -------------------------------------------------
+
+// CreateRepoInput configures repository creation. Slug is the repository
+// identifier: the Cloud repo slug (path), or — on Data Center — the repository
+// name (DC derives the slug from the name). Name overrides the display name
+// when set. Public inverts the usual private default (Cloud repos are private
+// by default). SCM defaults to "git" when empty. CloudProject sets the Cloud
+// project key; Forkable is a DC-only flag.
+type CreateRepoInput struct {
+	Slug          string
+	Name          string
+	Description   string
+	SCM           string
+	DefaultBranch string
+	Public        bool
+	Forkable      bool // DC only
+	CloudProject  string
+}
+
+// CreateRepo creates a repository and returns the normalized result, reusing
+// the read-side mappers above.
+func (c *Client) CreateRepo(ctx context.Context, scope Scope, in CreateRepoInput) (*Repo, error) {
+	switch c.Kind {
+	case KindCloud:
+		if scope.Workspace == "" {
+			return nil, fmt.Errorf("workspace is required; use --workspace or set a context")
+		}
+		slug := strings.TrimSpace(in.Slug)
+		if slug == "" {
+			return nil, fmt.Errorf("repository slug is required as the positional argument")
+		}
+		name := in.Name
+		if name == "" {
+			name = slug
+		}
+		repo, err := c.cloud.CreateRepository(ctx, scope.Workspace, cloud.CreateRepositoryInput{
+			Slug:        slug,
+			Name:        name,
+			Description: in.Description,
+			IsPrivate:   !in.Public,
+			ProjectKey:  in.CloudProject,
+		})
+		if err != nil {
+			return nil, mapHTTPError(err, "repository")
+		}
+		r := mapCloudRepo(repo)
+		if r.Workspace == "" {
+			r.Workspace = scope.Workspace
+		}
+		if in.DefaultBranch != "" {
+			r.DefaultBranch = in.DefaultBranch
+		}
+		return &r, nil
+	case KindDC:
+		if scope.ProjectKey == "" {
+			return nil, fmt.Errorf("project key is required; use --project or set a context")
+		}
+		name := in.Name
+		if name == "" {
+			name = strings.TrimSpace(in.Slug)
+		}
+		if name == "" {
+			return nil, fmt.Errorf("repository name is required as the positional argument")
+		}
+		repo, err := c.dc.CreateRepository(ctx, scope.ProjectKey, dc.CreateRepositoryInput{
+			Name:          name,
+			SCMID:         in.SCM,
+			Forkable:      in.Forkable,
+			Public:        in.Public,
+			Description:   in.Description,
+			DefaultBranch: in.DefaultBranch,
+		})
+		if err != nil {
+			return nil, mapHTTPError(err, "repository")
+		}
+		r := mapDCRepo(repo)
+		if r.Project == "" {
+			r.Project = scope.ProjectKey
+		}
+		return &r, nil
+	}
+	return nil, fmt.Errorf("unsupported host kind %q", c.Kind)
+}
+
+// RepoCloneURL resolves the clone URL for the repository in scope (slug taken
+// from scope.RepoSlug). ssh selects the SSH clone link over HTTPS when both are
+// advertised. It reuses GetRepo so the resolution path is shared with reads.
+func (c *Client) RepoCloneURL(ctx context.Context, scope Scope, ssh bool) (string, error) {
+	r, err := c.GetRepo(ctx, scope, "")
+	if err != nil {
+		return "", err
+	}
+	if ssh && r.CloneSSH != "" {
+		return r.CloneSSH, nil
+	}
+	if r.CloneHTTPS != "" {
+		return r.CloneHTTPS, nil
+	}
+	return r.CloneSSH, nil
+}
+
+// DefaultBranch resolves the repository's default branch, used as the default
+// PR target. It reuses GetRepo.
+func (c *Client) DefaultBranch(ctx context.Context, scope Scope) (string, error) {
+	r, err := c.GetRepo(ctx, scope, "")
+	if err != nil {
+		return "", err
+	}
+	return r.DefaultBranch, nil
+}
