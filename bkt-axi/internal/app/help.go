@@ -17,6 +17,17 @@ func (a *App) runHome() error {
 	if a.Home != nil {
 		return a.Home(a)
 	}
+	a.Println(a.RootHelp())
+	return nil
+}
+
+// RootHelp renders the static identity view (bin, description, the command
+// surface as a commands[N] TOON block, and an orienting help hint). It is the
+// single source the SKILL.md generator extracts its command list from (AXI §7
+// "single source of truth"), so the committed skill can never drift from the
+// CLI's own surface. It mirrors the fallback no-args view so a human running
+// `bkt-axi` with no auth and the generated skill see identical command lists.
+func (a *App) RootHelp() string {
 	rows := make([]axi.Object, 0, len(a.Commands))
 	for _, n := range a.Commands {
 		rows = append(rows, axi.NewObject(
@@ -30,8 +41,7 @@ func (a *App) runHome() error {
 		axi.KV{Key: "commands", Value: rows},
 		axi.KV{Key: "help", Value: axi.HelpRows([]string{"Run `bkt-axi <command> --help` for details"})},
 	)
-	a.Println(axi.Marshal(doc))
-	return nil
+	return axi.Marshal(doc)
 }
 
 // displayBin returns the executable path with the home directory collapsed to ~.

@@ -100,6 +100,25 @@ go build ./cmd/bkt-axi && go vet ./... && go test ./...
 
 Salvaged client tests must stay green: `go test ./internal/bitbucket/...`.
 
+## Session integration & generated skill (AXI §7)
+
+- `internal/session` owns the installers for Claude Code (`~/.claude/settings.json`
+  `SessionStart`), Codex (`~/.codex/hooks.json` + `[features].hooks = true` in
+  `config.toml` — the canonical flag; `codex_hooks` is a legacy alias), and
+  OpenCode (a managed plugin at `~/.config/opencode/plugins/bkt_axi.ts` using
+  `experimental.chat.system.transform`). `bkt-axi setup` is the only user-invoked
+  entry point (AXI §7 "explicit opt-in").
+- Installers are idempotent and path-repairing, and **non-destructive**: a tiny
+  order-preserving JSON model (`session/ojson.go`) edits only the hook entry that
+  runs this binary, preserving every other key the user has. "Our" handler is
+  detected by program basename `bkt-axi`; a stale path is updated in place.
+- Portable commands: `ResolveCommand` uses the bare PATH name when it resolves to
+  this executable, else the absolute path.
+- The committed `skills/bkt-axi/SKILL.md` is **generated** from `app.RootHelp()`
+  via `extractCommandsBlock` — never hand-edit it. `commands/skill_freshness_test.go`
+  (`TestSkillNotStale`) fails CI if it drifts; regenerate with
+  `BKT_AXI_GEN_SKILL=1 go test ./internal/commands/ -run TestRegenerateSkillArtifact`.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
