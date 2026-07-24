@@ -1,0 +1,5 @@
+# Per-repo no-mistakes overrides.
+# This repo is on GitHub: no-mistakes can open PRs via gh, but CI is not configured yet.
+# Pipeline runs skip ci step only; pr step remains active.
+skip_steps:
+  - ci
