@@ -35,6 +35,7 @@ func NewApp(binPath string) *app.App {
 			NewAdminCmd(),
 			NewAPICmd(),
 			NewContextCmd(),
+			NewSetupCmd(),
 		},
 	}
 	a.Home = RunHome

@@ -13,9 +13,12 @@ output, and error layers are rebuilt from scratch around AXI and a bespoke
 dispatcher (no cobra). One binary talks to **both** Bitbucket Cloud and Data
 Center through a single normalized command surface.
 
-> **Status:** Phases 0–5 complete — full read/write command surface, structured
-> error translation, a `bkt`→`bkt-axi` deprecation layer, and token benchmarks.
-> See [AGENTS.md](./AGENTS.md) for the engineering notes agents need to work here.
+> **Status:** Phases 0–5 complete — foundation, full read/write command surface
+> across all nouns, content-first home view, AXI §7 session integration
+> (`bkt-axi setup` installs Claude Code / Codex / OpenCode hooks and generates
+> the installable skill), structured error translation, a `bkt`→`bkt-axi`
+> deprecation layer, and token benchmarks. See [AGENTS.md](./AGENTS.md) for the
+> engineering notes agents need to work here.
 
 ---
 
@@ -199,7 +202,10 @@ internal/
   config/             salvaged Host + Context model
   git/                salvaged remote parsing + default-branch inference
   oauth/              salvaged Cloud OAuth flow
-  commands/           full command tree + App wiring
+  commands/           commands + App wiring (home, pr, auth, repo, …, setup)
+  types/              salvaged shared types
+  iostreams/          salvaged IO streams
+  session/            AXI §7 session-hook installers + generated skill
 ```
 
 **The one-switch principle:** every old command switched on `host.Kind`. In
@@ -216,3 +222,49 @@ go build ./cmd/bkt-axi && go vet ./... && go test ./...
 ```
 
 Salvaged client tests must stay green: `go test ./internal/bitbucket/...`.
+
+### Output contract
+
+- All stdout is **TOON by default**; `--json`/`--yaml` are escape hatches.
+- Errors go to **stdout** as `error: …` + a `help[N]{step}:` hint block.
+- Exit codes: `0` success (incl. idempotent no-ops), `1` error, `2` usage.
+- Unknown flags are rejected by name with an inline valid-flag list (exit 2).
+- Long content (descriptions) is truncated to 500 chars with a `--full` escape hatch.
+
+### Scope resolution
+
+`Scope{Workspace|ProjectKey, RepoSlug}` resolves once per invocation from:
+explicit flags (`--repo`, `--workspace`/`--project`) → active context →
+git-remote inference from the working directory.
+
+## Session integration & skill (AXI §7)
+
+`bkt-axi setup` installs a `SessionStart` hook that injects the live home view
+(your open PRs and those awaiting review) at the start of every session, scoped
+to the current repository. It is idempotent and path-repairing.
+
+```sh
+bkt-axi setup --app all            # Claude Code + Codex + OpenCode hooks
+bkt-axi setup --app claude --skill # Claude hook + install the skill
+```
+
+| App | Where the hook lands | How context is injected |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` (`SessionStart`) | hook stdout |
+| Codex | `~/.codex/hooks.json` + `[features].hooks = true` in `config.toml` | hook stdout |
+| OpenCode | `~/.config/opencode/plugins/bkt_axi.ts` | `experimental.chat.system.transform` |
+
+A static `skills/bkt-axi/SKILL.md` is **generated** from the CLI's own root help
+(`app.RootHelp` → `extractCommandsBlock`), so it can never drift; a CI test
+(`go test ./internal/commands/ -run TestSkillNotStale`) fails if the committed
+skill is stale. Regenerate after changing the command surface:
+
+```sh
+BKT_AXI_GEN_SKILL=1 go test ./internal/commands/ -run TestRegenerateSkillArtifact
+```
+
+## Authentication
+
+Configure a host with `bkt-axi auth login`, or run headless with environment
+variables: `BKT_HOST`, `BKT_TOKEN` (+ `BKT_USERNAME` for Cloud, and optionally
+`BKT_WORKSPACE`/`BKT_PROJECT`/`BKT_REPO`). Inspect with `bkt-axi auth status`.
