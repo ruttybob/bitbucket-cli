@@ -54,7 +54,7 @@ func (c *Client) CreatePR(ctx context.Context, scope Scope, in CreatePRInput) (*
 		if in.DefaultReviewers {
 			def, err := c.cloud.GetEffectiveDefaultReviewers(ctx, scope.Workspace, scope.RepoSlug)
 			if err != nil {
-				return nil, mapHTTPError(err, "default reviewers")
+				return nil, c.mapErr(err, "default reviewers")
 			}
 			reviewers = mergeReviewers(reviewers, cloudReviewerIdentities(def))
 		}
@@ -68,7 +68,7 @@ func (c *Client) CreatePR(ctx context.Context, scope Scope, in CreatePRInput) (*
 			Draft:       in.Draft,
 		})
 		if err != nil {
-			return nil, mapHTTPError(err, "pull request")
+			return nil, c.mapErr(err, "pull request")
 		}
 		m := mapCloudPR(pr)
 		return &m, nil
@@ -80,7 +80,7 @@ func (c *Client) CreatePR(ctx context.Context, scope Scope, in CreatePRInput) (*
 		if in.DefaultReviewers {
 			def, err := c.dc.GetDefaultReviewers(ctx, scope.ProjectKey, scope.RepoSlug, in.SourceBranch, in.TargetBranch)
 			if err != nil {
-				return nil, mapHTTPError(err, "default reviewers")
+				return nil, c.mapErr(err, "default reviewers")
 			}
 			reviewers = mergeReviewers(reviewers, dcUserSlugs(def))
 		}
@@ -96,7 +96,7 @@ func (c *Client) CreatePR(ctx context.Context, scope Scope, in CreatePRInput) (*
 			Draft:            in.Draft,
 		})
 		if err != nil {
-			return nil, mapHTTPError(err, "pull request")
+			return nil, c.mapErr(err, "pull request")
 		}
 		m := mapDCPR(pr)
 		return &m, nil
@@ -137,13 +137,13 @@ func (c *Client) UpdatePR(ctx context.Context, scope Scope, id int, in UpdatePRI
 		if len(in.ReviewersAdd) > 0 || len(in.ReviewersRemove) > 0 || in.DefaultReviewers {
 			current, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 			if err != nil {
-				return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+				return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 			}
 			merged := mergeReviewerChanges(cloudReviewerIdentities(current.Reviewers), in.ReviewersAdd, in.ReviewersRemove)
 			if in.DefaultReviewers {
 				def, err := c.cloud.GetEffectiveDefaultReviewers(ctx, scope.Workspace, scope.RepoSlug)
 				if err != nil {
-					return nil, mapHTTPError(err, "default reviewers")
+					return nil, c.mapErr(err, "default reviewers")
 				}
 				merged = mergeReviewers(merged, cloudReviewerIdentities(def))
 			}
@@ -151,7 +151,7 @@ func (c *Client) UpdatePR(ctx context.Context, scope Scope, id int, in UpdatePRI
 		}
 		pr, err := c.cloud.UpdatePullRequest(ctx, scope.Workspace, scope.RepoSlug, id, input)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		m := mapCloudPR(pr)
 		return &m, nil
@@ -211,7 +211,7 @@ func (c *Client) PRDiff(ctx context.Context, scope Scope, id int, w io.Writer) e
 			return fmt.Errorf("workspace and repo are required; use --workspace/--repo or set a context")
 		}
 		if err := c.cloud.PullRequestDiff(ctx, scope.Workspace, scope.RepoSlug, id, w); err != nil {
-			return mapHTTPError(err, fmt.Sprintf("pull request #%d diff", id))
+			return c.mapErr(err, fmt.Sprintf("pull request #%d diff", id))
 		}
 		return nil
 	case KindDC:
@@ -219,7 +219,7 @@ func (c *Client) PRDiff(ctx context.Context, scope Scope, id int, w io.Writer) e
 			return fmt.Errorf("project and repo are required; use --project/--repo or set a context")
 		}
 		if err := c.dc.PullRequestDiff(ctx, scope.ProjectKey, scope.RepoSlug, id, w); err != nil {
-			return mapHTTPError(err, fmt.Sprintf("pull request #%d diff", id))
+			return c.mapErr(err, fmt.Sprintf("pull request #%d diff", id))
 		}
 		return nil
 	}
@@ -249,7 +249,7 @@ func (c *Client) PRCheckout(ctx context.Context, scope Scope, id int, ssh bool) 
 		}
 		pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
-			return CheckoutRef{}, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return CheckoutRef{}, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		branch := pr.Source.Branch.Name
 		if branch == "" {
@@ -266,7 +266,7 @@ func (c *Client) PRCheckout(ctx context.Context, scope Scope, id int, ssh bool) 
 		}
 		pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 		if err != nil {
-			return CheckoutRef{}, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return CheckoutRef{}, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		return CheckoutRef{
 			Branch:   pr.FromRef.DisplayID,
@@ -288,7 +288,7 @@ func (c *Client) ApprovePR(ctx context.Context, scope Scope, id int) (*PRMutatio
 		}
 		pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		identity, _ := c.cloudCurrentIdentity(ctx)
 		if identity != "" && cloudApprovedBy(pr, identity) {
@@ -296,7 +296,7 @@ func (c *Client) ApprovePR(ctx context.Context, scope Scope, id int) (*PRMutatio
 			return &PRMutation{PR: &m, Already: true}, nil
 		}
 		if err := c.cloud.ApprovePullRequest(ctx, scope.Workspace, scope.RepoSlug, id); err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		updated, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
@@ -311,7 +311,7 @@ func (c *Client) ApprovePR(ctx context.Context, scope Scope, id int) (*PRMutatio
 		}
 		pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		slug := c.dcUsername()
 		if slug != "" && dcApprovedBy(pr, slug) {
@@ -319,7 +319,7 @@ func (c *Client) ApprovePR(ctx context.Context, scope Scope, id int) (*PRMutatio
 			return &PRMutation{PR: &m, Already: true}, nil
 		}
 		if err := c.dc.ApprovePullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id); err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		m := mapDCPR(pr)
 		return &PRMutation{PR: &m}, nil
@@ -349,14 +349,14 @@ func (c *Client) MergePR(ctx context.Context, scope Scope, id int, in MergePRInp
 		}
 		pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		if strings.EqualFold(pr.State, "MERGED") {
 			m := mapCloudPR(pr)
 			return &PRMutation{PR: &m, Already: true}, nil
 		}
 		if err := c.cloud.MergePullRequest(ctx, scope.Workspace, scope.RepoSlug, id, in.Message, strategy, in.CloseSource); err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		updated, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
@@ -391,14 +391,14 @@ func (c *Client) DeclinePR(ctx context.Context, scope Scope, id int, message str
 		}
 		pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		if strings.EqualFold(pr.State, "DECLINED") {
 			m := mapCloudPR(pr)
 			return &PRMutation{PR: &m, Already: true}, nil
 		}
 		if err := c.cloud.DeclinePullRequest(ctx, scope.Workspace, scope.RepoSlug, id, message); err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		updated, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
@@ -428,14 +428,14 @@ func (c *Client) ReopenPR(ctx context.Context, scope Scope, id int) (*PRMutation
 		}
 		pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		if strings.EqualFold(pr.State, "OPEN") {
 			m := mapCloudPR(pr)
 			return &PRMutation{PR: &m, Already: true}, nil
 		}
 		if err := c.cloud.ReopenPullRequest(ctx, scope.Workspace, scope.RepoSlug, id); err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		updated, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
@@ -466,7 +466,7 @@ func (c *Client) CommentPR(ctx context.Context, scope Scope, id int, text string
 		}
 		created, err := c.cloud.CreatePullRequestComment(ctx, scope.Workspace, scope.RepoSlug, id, cloud.CommentOptions{Text: text})
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d comment", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d comment", id))
 		}
 		return &Comment{ID: created.ID, Text: text}, nil
 	case KindDC:
@@ -475,7 +475,7 @@ func (c *Client) CommentPR(ctx context.Context, scope Scope, id int, text string
 		}
 		created, err := c.dc.CreatePullRequestComment(ctx, scope.ProjectKey, scope.RepoSlug, id, dc.CommentOptions{Text: text})
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d comment", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d comment", id))
 		}
 		return &Comment{ID: created.ID, Text: text}, nil
 	}
@@ -496,7 +496,7 @@ func (c *Client) CommentPR(ctx context.Context, scope Scope, id int, text string
 func (c *Client) dcMutate(ctx context.Context, scope Scope, id int, targetState, noun string, attempt func(version int) error) (*PRMutation, error) {
 	pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 	if err != nil {
-		return nil, mapHTTPError(err, noun)
+		return nil, c.mapErr(err, noun)
 	}
 	if targetState != "" && strings.EqualFold(pr.State, targetState) {
 		m := mapDCPR(pr)
@@ -507,18 +507,18 @@ func (c *Client) dcMutate(ctx context.Context, scope Scope, id int, targetState,
 		if isStaleVersion(err) {
 			fresh, ferr := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 			if ferr != nil {
-				return nil, mapHTTPError(err, noun)
+				return nil, c.mapErr(err, noun)
 			}
 			if targetState != "" && strings.EqualFold(fresh.State, targetState) {
 				m := mapDCPR(fresh)
 				return &PRMutation{PR: &m, Already: true}, nil
 			}
 			if err := attempt(fresh.Version); err != nil {
-				return nil, mapHTTPError(err, noun)
+				return nil, c.mapErr(err, noun)
 			}
 			pr = fresh
 		} else {
-			return nil, mapHTTPError(err, noun)
+			return nil, c.mapErr(err, noun)
 		}
 	}
 

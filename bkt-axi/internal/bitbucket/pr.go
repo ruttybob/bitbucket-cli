@@ -8,7 +8,6 @@ import (
 
 	"github.com/ruttybob/bkt-axi/internal/bitbucket/cloud"
 	"github.com/ruttybob/bkt-axi/internal/bitbucket/dc"
-	"github.com/ruttybob/bkt-axi/internal/bitbucket/httpx"
 )
 
 // pr.go adapts the salvaged line-specific clients into the normalized PR
@@ -61,7 +60,7 @@ func (c *Client) listPRsCloud(ctx context.Context, scope Scope, opts PRListOptio
 		Reviewer: opts.Reviewer,
 	}, "")
 	if err != nil {
-		return nil, mapHTTPError(err, "pull requests")
+		return nil, c.mapErr(err, "pull requests")
 	}
 	prs := make([]PR, 0, len(page.Values))
 	for i := range page.Values {
@@ -87,7 +86,7 @@ func (c *Client) listPRsDC(ctx context.Context, scope Scope, opts PRListOptions,
 	}
 	page, err := c.dc.ListRepoPullRequestsPage(ctx, scope.ProjectKey, scope.RepoSlug, do)
 	if err != nil {
-		return nil, mapHTTPError(err, "pull requests")
+		return nil, c.mapErr(err, "pull requests")
 	}
 	prs := make([]PR, 0, len(page.Values))
 	for i := range page.Values {
@@ -105,7 +104,7 @@ func (c *Client) GetPR(ctx context.Context, scope Scope, id int) (*PR, error) {
 		}
 		pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		m := mapCloudPR(pr)
 		return &m, nil
@@ -115,7 +114,7 @@ func (c *Client) GetPR(ctx context.Context, scope Scope, id int) (*PR, error) {
 		}
 		pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		m := mapDCPR(pr)
 		return &m, nil
@@ -132,7 +131,7 @@ func (c *Client) ListComments(ctx context.Context, scope Scope, id int) ([]Comme
 		}
 		comments, err := c.cloud.ListPullRequestComments(ctx, scope.Workspace, scope.RepoSlug, id, 100)
 		if err != nil {
-			return nil, mapHTTPError(err, "comments")
+			return nil, c.mapErr(err, "comments")
 		}
 		out := make([]Comment, 0, len(comments))
 		for i := range comments {
@@ -145,7 +144,7 @@ func (c *Client) ListComments(ctx context.Context, scope Scope, id int) ([]Comme
 		}
 		comments, err := c.dc.ListPullRequestComments(ctx, scope.ProjectKey, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, "comments")
+			return nil, c.mapErr(err, "comments")
 		}
 		out := make([]Comment, 0, len(comments))
 		for i := range comments {
@@ -328,18 +327,8 @@ func firstDCSelfLink(links []struct {
 	return links[0].Href
 }
 
-// mapHTTPError unwraps an upstream *httpx.HTTPError and routes it through the
-// axi error map. Non-HTTP errors pass through as a generic runtime error.
-func mapHTTPError(err error, noun string) error {
-	var he *httpx.HTTPError
-	if asHTTPError(err, &he) {
-		return axiMap(he, noun)
-	}
-	return err
-}
-
-// axiMap and asHTTPError live in errmap.go to keep this file free of the axi
-// import boundary's details.
+// Adapter error translation is centralized in httperr.go's Client.mapErr (it
+// threads host kind and Retry-After); call sites use c.mapErr(err, noun).
 
 func parseTime(s string) time.Time {
 	if s == "" {

@@ -34,7 +34,7 @@ func (c *Client) ListWebhooks(ctx context.Context, scope Scope) (*WebhookListRes
 		}
 		hooks, err := c.cloud.ListWebhooks(ctx, scope.Workspace, scope.RepoSlug)
 		if err != nil {
-			return nil, mapHTTPError(err, "webhooks")
+			return nil, c.mapErr(err, "webhooks")
 		}
 		out := make([]Webhook, 0, len(hooks))
 		for i := range hooks {
@@ -47,7 +47,7 @@ func (c *Client) ListWebhooks(ctx context.Context, scope Scope) (*WebhookListRes
 		}
 		hooks, err := c.dc.ListWebhooks(ctx, scope.ProjectKey, scope.RepoSlug)
 		if err != nil {
-			return nil, mapHTTPError(err, "webhooks")
+			return nil, c.mapErr(err, "webhooks")
 		}
 		out := make([]Webhook, 0, len(hooks))
 		for i := range hooks {
@@ -76,7 +76,7 @@ func (c *Client) CreateWebhook(ctx context.Context, scope Scope, in WebhookCreat
 			Active:      in.Active,
 		})
 		if err != nil {
-			return nil, mapHTTPError(err, "webhook")
+			return nil, c.mapErr(err, "webhook")
 		}
 		m := mapCloudWebhook(hook)
 		return &m, nil
@@ -91,7 +91,7 @@ func (c *Client) CreateWebhook(ctx context.Context, scope Scope, in WebhookCreat
 			Active: in.Active,
 		})
 		if err != nil {
-			return nil, mapHTTPError(err, "webhook")
+			return nil, c.mapErr(err, "webhook")
 		}
 		m := mapDCWebhook(hook)
 		return &m, nil
@@ -112,7 +112,7 @@ func (c *Client) DeleteWebhook(ctx context.Context, scope Scope, id string) (boo
 			if isNotFound(err) {
 				return false, nil
 			}
-			return false, mapHTTPError(err, "webhook "+id)
+			return false, c.mapErr(err, "webhook "+id)
 		}
 		return true, nil
 	case KindDC:
@@ -127,7 +127,7 @@ func (c *Client) DeleteWebhook(ctx context.Context, scope Scope, id string) (boo
 			if isNotFound(err) {
 				return false, nil
 			}
-			return false, mapHTTPError(err, "webhook "+id)
+			return false, c.mapErr(err, "webhook "+id)
 		}
 		return true, nil
 	}
@@ -149,7 +149,7 @@ func (c *Client) TestWebhook(ctx context.Context, scope Scope, id string) error 
 			return fmt.Errorf("webhook id %q is not a number", id)
 		}
 		if err := c.dc.TestWebhook(ctx, scope.ProjectKey, scope.RepoSlug, nid); err != nil {
-			return mapHTTPError(err, "webhook "+id)
+			return c.mapErr(err, "webhook "+id)
 		}
 		return nil
 	}

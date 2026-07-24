@@ -21,7 +21,7 @@ func (c *Client) ListProjectPermissions(ctx context.Context, projectKey string, 
 	}
 	perms, err := c.dc.ListProjectPermissions(ctx, projectKey, limit)
 	if err != nil {
-		return nil, mapHTTPError(err, "project permissions")
+		return nil, c.mapErr(err, "project permissions")
 	}
 	return mapPerms(perms), nil
 }
@@ -35,7 +35,7 @@ func (c *Client) GrantProjectPermission(ctx context.Context, projectKey, user, p
 		return projectKeyRequired(Scope{})
 	}
 	if err := c.dc.GrantProjectPermission(ctx, projectKey, user, perm); err != nil {
-		return mapHTTPError(err, "project permission for "+user)
+		return c.mapErr(err, "project permission for "+user)
 	}
 	return nil
 }
@@ -49,7 +49,7 @@ func (c *Client) RevokeProjectPermission(ctx context.Context, projectKey, user s
 		return projectKeyRequired(Scope{})
 	}
 	if err := c.dc.RevokeProjectPermission(ctx, projectKey, user); err != nil {
-		return mapHTTPError(err, "project permission for "+user)
+		return c.mapErr(err, "project permission for "+user)
 	}
 	return nil
 }
@@ -64,7 +64,7 @@ func (c *Client) ListRepoPermissions(ctx context.Context, scope Scope, limit int
 	}
 	perms, err := c.dc.ListRepoPermissions(ctx, scope.ProjectKey, scope.RepoSlug, limit)
 	if err != nil {
-		return nil, mapHTTPError(err, "repository permissions")
+		return nil, c.mapErr(err, "repository permissions")
 	}
 	return mapPerms(perms), nil
 }
@@ -78,7 +78,7 @@ func (c *Client) GrantRepoPermission(ctx context.Context, scope Scope, user, per
 		return fmt.Errorf("project and repo are required; use --project/--repo or set a context")
 	}
 	if err := c.dc.GrantRepoPermission(ctx, scope.ProjectKey, scope.RepoSlug, user, perm); err != nil {
-		return mapHTTPError(err, "repository permission for "+user)
+		return c.mapErr(err, "repository permission for "+user)
 	}
 	return nil
 }
@@ -92,7 +92,7 @@ func (c *Client) RevokeRepoPermission(ctx context.Context, scope Scope, user str
 		return fmt.Errorf("project and repo are required; use --project/--repo or set a context")
 	}
 	if err := c.dc.RevokeRepoPermission(ctx, scope.ProjectKey, scope.RepoSlug, user); err != nil {
-		return mapHTTPError(err, "repository permission for "+user)
+		return c.mapErr(err, "repository permission for "+user)
 	}
 	return nil
 }

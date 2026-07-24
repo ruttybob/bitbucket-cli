@@ -51,7 +51,7 @@ func (c *Client) listReposCloud(ctx context.Context, scope Scope, opts RepoListO
 	}
 	page, err := c.cloud.ListRepositoriesPage(ctx, scope.Workspace, limit, "")
 	if err != nil {
-		return nil, mapHTTPError(err, "repositories")
+		return nil, c.mapErr(err, "repositories")
 	}
 	repos := make([]Repo, 0, len(page.Values))
 	for i := range page.Values {
@@ -69,7 +69,7 @@ func (c *Client) listReposDC(ctx context.Context, scope Scope, opts RepoListOpti
 	}
 	page, err := c.dc.ListRepositoriesPage(ctx, scope.ProjectKey, limit, 0)
 	if err != nil {
-		return nil, mapHTTPError(err, "repositories")
+		return nil, c.mapErr(err, "repositories")
 	}
 	repos := make([]Repo, 0, len(page.Values))
 	for i := range page.Values {
@@ -100,7 +100,7 @@ func (c *Client) GetRepo(ctx context.Context, scope Scope, slug string) (*Repo, 
 		}
 		repo, err := c.cloud.GetRepository(ctx, scope.Workspace, slug)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("repository %s/%s", scope.Workspace, slug))
+			return nil, c.mapErr(err, fmt.Sprintf("repository %s/%s", scope.Workspace, slug))
 		}
 		r := mapCloudRepo(repo)
 		return &r, nil
@@ -110,7 +110,7 @@ func (c *Client) GetRepo(ctx context.Context, scope Scope, slug string) (*Repo, 
 		}
 		repo, err := c.dc.GetRepository(ctx, scope.ProjectKey, slug)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("repository %s/%s", scope.ProjectKey, slug))
+			return nil, c.mapErr(err, fmt.Sprintf("repository %s/%s", scope.ProjectKey, slug))
 		}
 		r := mapDCRepo(repo)
 		return &r, nil
@@ -280,7 +280,7 @@ func (c *Client) CreateRepo(ctx context.Context, scope Scope, in CreateRepoInput
 			ProjectKey:  in.CloudProject,
 		})
 		if err != nil {
-			return nil, mapHTTPError(err, "repository")
+			return nil, c.mapErr(err, "repository")
 		}
 		r := mapCloudRepo(repo)
 		if r.Workspace == "" {
@@ -310,7 +310,7 @@ func (c *Client) CreateRepo(ctx context.Context, scope Scope, in CreateRepoInput
 			DefaultBranch: in.DefaultBranch,
 		})
 		if err != nil {
-			return nil, mapHTTPError(err, "repository")
+			return nil, c.mapErr(err, "repository")
 		}
 		r := mapDCRepo(repo)
 		if r.Project == "" {

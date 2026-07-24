@@ -17,7 +17,7 @@ func (c *Client) RotateSecret(ctx context.Context) error {
 		return DCOnly("admin secrets rotation", c.hostKindLabel())
 	}
 	if err := c.dc.RotateSecret(ctx); err != nil {
-		return mapHTTPError(err, "secret rotation")
+		return c.mapErr(err, "secret rotation")
 	}
 	return nil
 }
@@ -35,7 +35,7 @@ func (c *Client) GetLoggingLevel(ctx context.Context) (*LoggingLevel, error) {
 	}
 	cfg, err := c.dc.GetLoggingConfig(ctx)
 	if err != nil {
-		return nil, mapHTTPError(err, "logging config")
+		return nil, c.mapErr(err, "logging config")
 	}
 	return &LoggingLevel{Level: cfg.Level, Async: cfg.Async}, nil
 }
@@ -47,7 +47,7 @@ func (c *Client) SetLoggingLevel(ctx context.Context, level string) (*LoggingLev
 	}
 	cfg := dc.LoggingConfig{Level: level}
 	if err := c.dc.UpdateLoggingConfig(ctx, cfg); err != nil {
-		return nil, mapHTTPError(err, "logging config")
+		return nil, c.mapErr(err, "logging config")
 	}
 	return &LoggingLevel{Level: level}, nil
 }

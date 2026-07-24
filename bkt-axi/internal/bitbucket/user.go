@@ -22,7 +22,7 @@ func (c *Client) CurrentUser(ctx context.Context) (identity, display string, err
 	case KindCloud:
 		u, err := c.cloud.CurrentUser(ctx)
 		if err != nil {
-			return "", "", mapHTTPError(err, "current user")
+			return "", "", c.mapErr(err, "current user")
 		}
 		id := strings.TrimSpace(u.UUID)
 		if id == "" {

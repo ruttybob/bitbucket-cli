@@ -26,7 +26,7 @@ func (c *Client) ListPRReviewers(ctx context.Context, scope Scope, id int) ([]Re
 		}
 		pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		return mapCloudReviewers(pr), nil
 	case KindDC:
@@ -35,7 +35,7 @@ func (c *Client) ListPRReviewers(ctx context.Context, scope Scope, id int) ([]Re
 		}
 		pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		return mapDCReviewers(pr.Reviewers), nil
 	}
@@ -77,7 +77,7 @@ func (c *Client) RemovePRReviewer(ctx context.Context, scope Scope, id int, user
 func (c *Client) cloudAddReviewer(ctx context.Context, scope Scope, id int, user string) (bool, error) {
 	pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 	if err != nil {
-		return false, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+		return false, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 	}
 	if cloudReviewerPresent(user, pr.Reviewers) {
 		return false, nil
@@ -86,7 +86,7 @@ func (c *Client) cloudAddReviewer(ctx context.Context, scope Scope, id int, user
 	if _, err := c.cloud.UpdatePullRequest(ctx, scope.Workspace, scope.RepoSlug, id, cloud.UpdatePullRequestInput{
 		Reviewers: list,
 	}); err != nil {
-		return false, mapHTTPError(err, "reviewer "+user)
+		return false, c.mapErr(err, "reviewer "+user)
 	}
 	return true, nil
 }
@@ -94,7 +94,7 @@ func (c *Client) cloudAddReviewer(ctx context.Context, scope Scope, id int, user
 func (c *Client) cloudRemoveReviewer(ctx context.Context, scope Scope, id int, user string) (bool, error) {
 	pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 	if err != nil {
-		return false, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+		return false, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 	}
 	list := cloudReviewerIdentities(pr.Reviewers)
 	next := make([]string, 0, len(list))
@@ -112,7 +112,7 @@ func (c *Client) cloudRemoveReviewer(ctx context.Context, scope Scope, id int, u
 	if _, err := c.cloud.UpdatePullRequest(ctx, scope.Workspace, scope.RepoSlug, id, cloud.UpdatePullRequestInput{
 		Reviewers: next,
 	}); err != nil {
-		return false, mapHTTPError(err, "reviewer "+user)
+		return false, c.mapErr(err, "reviewer "+user)
 	}
 	return true, nil
 }
@@ -120,7 +120,7 @@ func (c *Client) cloudRemoveReviewer(ctx context.Context, scope Scope, id int, u
 func (c *Client) dcAddReviewer(ctx context.Context, scope Scope, id int, user string) (bool, error) {
 	pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 	if err != nil {
-		return false, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+		return false, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 	}
 	for _, r := range pr.Reviewers {
 		if dcUserMatches(user, r.User) {
@@ -137,7 +137,7 @@ func (c *Client) dcAddReviewer(ctx context.Context, scope Scope, id int, user st
 func (c *Client) dcRemoveReviewer(ctx context.Context, scope Scope, id int, user string) (bool, error) {
 	pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 	if err != nil {
-		return false, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+		return false, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 	}
 	next := make([]dc.PullRequestReviewer, 0, len(pr.Reviewers))
 	removed := false
@@ -170,7 +170,7 @@ func (c *Client) dcUpdateReviewers(ctx context.Context, scope Scope, id int, pr 
 		FromRef:     fromRef,
 		ToRef:       toRef,
 	}); err != nil {
-		return mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+		return c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 	}
 	return nil
 }
@@ -260,7 +260,7 @@ func (c *Client) ListPRTasks(ctx context.Context, scope Scope, id int) ([]PullRe
 	}
 	tasks, err := c.dc.ListPullRequestTasks(ctx, scope.ProjectKey, scope.RepoSlug, id)
 	if err != nil {
-		return nil, mapHTTPError(err, fmt.Sprintf("tasks for pull request #%d", id))
+		return nil, c.mapErr(err, fmt.Sprintf("tasks for pull request #%d", id))
 	}
 	out := make([]PullRequestTask, 0, len(tasks))
 	for i := range tasks {
@@ -279,7 +279,7 @@ func (c *Client) CreatePRTask(ctx context.Context, scope Scope, id int, text str
 	}
 	task, err := c.dc.CreatePullRequestTask(ctx, scope.ProjectKey, scope.RepoSlug, id, text)
 	if err != nil {
-		return nil, mapHTTPError(err, fmt.Sprintf("tasks for pull request #%d", id))
+		return nil, c.mapErr(err, fmt.Sprintf("tasks for pull request #%d", id))
 	}
 	m := mapDCTask(task)
 	return &m, nil
@@ -306,7 +306,7 @@ func (c *Client) setPRTask(ctx context.Context, scope Scope, id, taskID int, res
 	}
 	tasks, err := c.dc.ListPullRequestTasks(ctx, scope.ProjectKey, scope.RepoSlug, id)
 	if err != nil {
-		return nil, false, mapHTTPError(err, fmt.Sprintf("tasks for pull request #%d", id))
+		return nil, false, c.mapErr(err, fmt.Sprintf("tasks for pull request #%d", id))
 	}
 	want := dc.TaskStateResolved
 	if !resolve {
@@ -320,7 +320,7 @@ func (c *Client) setPRTask(ctx context.Context, scope Scope, id, taskID int, res
 	}
 	task, err := c.dc.SetPullRequestTaskState(ctx, scope.ProjectKey, scope.RepoSlug, id, taskID, resolve)
 	if err != nil {
-		return nil, false, mapHTTPError(err, fmt.Sprintf("task #%d", taskID))
+		return nil, false, c.mapErr(err, fmt.Sprintf("task #%d", taskID))
 	}
 	m := mapDCTask(task)
 	return &m, true, nil
@@ -351,7 +351,7 @@ func (c *Client) ListPRSuggestions(ctx context.Context, scope Scope, id int) ([]
 	}
 	comments, err := c.dc.ListPullRequestComments(ctx, scope.ProjectKey, scope.RepoSlug, id)
 	if err != nil {
-		return nil, mapHTTPError(err, fmt.Sprintf("suggestions for pull request #%d", id))
+		return nil, c.mapErr(err, fmt.Sprintf("suggestions for pull request #%d", id))
 	}
 	out := make([]Suggestion, 0)
 	for i := range comments {
@@ -375,10 +375,10 @@ func (c *Client) ApplyPRSuggestion(ctx context.Context, scope Scope, prID, comme
 	if sug, err := c.dc.SuggestionPreview(ctx, scope.ProjectKey, scope.RepoSlug, prID, commentID, suggestionID); err == nil && sug != nil && sug.Applied {
 		return false, nil
 	} else if err != nil && !isNotFound(err) {
-		return false, mapHTTPError(err, fmt.Sprintf("suggestion #%d", suggestionID))
+		return false, c.mapErr(err, fmt.Sprintf("suggestion #%d", suggestionID))
 	}
 	if err := c.dc.ApplySuggestion(ctx, scope.ProjectKey, scope.RepoSlug, prID, commentID, suggestionID); err != nil {
-		return false, mapHTTPError(err, fmt.Sprintf("suggestion #%d", suggestionID))
+		return false, c.mapErr(err, fmt.Sprintf("suggestion #%d", suggestionID))
 	}
 	return true, nil
 }
@@ -426,7 +426,7 @@ func (c *Client) PRChecks(ctx context.Context, scope Scope, id int) ([]BuildStat
 		}
 		pr, err := c.cloud.GetPullRequest(ctx, scope.Workspace, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		sha = strings.TrimSpace(pr.Source.Commit.Hash)
 	case KindDC:
@@ -435,7 +435,7 @@ func (c *Client) PRChecks(ctx context.Context, scope Scope, id int) ([]BuildStat
 		}
 		pr, err := c.dc.GetPullRequest(ctx, scope.ProjectKey, scope.RepoSlug, id)
 		if err != nil {
-			return nil, mapHTTPError(err, fmt.Sprintf("pull request #%d", id))
+			return nil, c.mapErr(err, fmt.Sprintf("pull request #%d", id))
 		}
 		sha = strings.TrimSpace(pr.FromRef.LatestCommit)
 	default:
